@@ -1,0 +1,16 @@
+{
+  "name": "sdr-signal-index",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "dev": "npm --workspace apps/web run dev",
+    "build": "npm --workspace apps/web run build",
+    "lint": "npm --workspace apps/web run lint",
+    "typecheck": "npm --workspace apps/web run typecheck",
+    "test": "npm --workspace apps/web run test",
+    "e2e": "npm --workspace apps/web run e2e"
+  },
+  "engines": {"node": ">=22.13.0"}
+}
+
