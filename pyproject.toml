@@ -11,6 +11,7 @@ dependencies = [
   "uvicorn[standard]>=0.35,<0.36",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
+  "email-validator>=2.2,<3",
   "sqlalchemy>=2.0.41,<2.1",
   "alembic>=1.16,<2",
   "psycopg[binary,pool]>=3.2.9,<4",
@@ -67,4 +68,3 @@ strict = true
 ignore_missing_imports = true
 disallow_untyped_decorators = false
 exclude = ["infra/migrations"]
-
