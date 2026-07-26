@@ -89,7 +89,17 @@ def search_sessions(db: Session, request: SearchRequest) -> tuple[list[dict[str,
             <= request.duration_max_sec
         )
     if request.text:
-        filters.append(TransmissionSession.title.ilike(f"%{request.text}%"))
+        filters.append(
+            or_(
+                TransmissionSession.title.ilike(f"%{request.text}%"),
+                TransmissionSession.callsigns.cast(String).ilike(
+                    f"%{request.text.upper()}%"
+                ),
+                TransmissionSession.number_groups.cast(String).ilike(
+                    f"%{request.text.replace(' ', '').replace('-', '')}%"
+                ),
+            )
+        )
     if request.callsign:
         filters.append(TransmissionSession.callsigns.cast(String).ilike(f"%{request.callsign.upper()}%"))
     if request.number_group:

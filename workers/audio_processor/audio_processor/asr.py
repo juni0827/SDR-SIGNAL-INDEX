@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from signal_index.config import get_settings
+from signal_index.config import Settings, get_settings
 
 
 @lru_cache(maxsize=2)
@@ -26,6 +26,7 @@ def _candidate(
     temperature: list[float],
     vad_filter: bool,
     profile: str,
+    model_name: str,
 ) -> dict[str, Any] | None:
     segments, info = engine.transcribe(
         str(path),
@@ -62,14 +63,14 @@ def _candidate(
         "language": str(info.language),
         "confidence": confidence,
         "word_timestamps": words,
-        "model_name": get_settings().ASR_MODEL,
+        "model_name": model_name,
         "model_version": f"faster-whisper:{profile}",
         "profile": profile,
     }
 
 
-def transcribe(path: Path) -> list[dict[str, Any]]:
-    settings = get_settings()
+def transcribe(path: Path, runtime_settings: Settings | None = None) -> list[dict[str, Any]]:
+    settings = runtime_settings or get_settings()
     engine = model(settings.ASR_MODEL, settings.ASR_DEVICE, settings.ASR_COMPUTE_TYPE)
     profiles: list[tuple[int, list[float], str]] = [
         (settings.ASR_BEAM_SIZE, [0.0, 0.2, 0.4, 0.6], "beam-primary")
@@ -90,6 +91,7 @@ def transcribe(path: Path) -> list[dict[str, Any]]:
             temperature=temperatures,
             vad_filter=settings.ASR_USE_VAD,
             profile=profile,
+            model_name=settings.ASR_MODEL,
         )
         if candidate is None:
             continue

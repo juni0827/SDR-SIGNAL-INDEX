@@ -32,6 +32,7 @@ POST /api/v1/search/events
 GET  /api/v1/sessions/{id}
 GET  /api/v1/segments/{id}
 POST /api/v1/segments/{id}/transcripts
+PATCH /api/v1/segments/{id}/transcripts/{transcript_id}/preferred
 GET  /api/v1/recordings/{id}
 GET  /api/v1/recordings/{id}/media
 GET  /api/v1/frequencies/{frequency_hz}/activity
@@ -46,6 +47,16 @@ GET  /api/v1/export/context-bundle
 POST /api/v1/export/context-bundle
 GET  /api/v1/export/evidence-bundle
 GET  /api/v1/events
+POST /api/v1/events
+PATCH /api/v1/events/{id}
+POST /api/v1/inbox/upload
+GET  /api/v1/inbox/{id}/media
+GET  /api/v1/graph-layouts
+POST /api/v1/graph-layouts
+GET  /api/v1/export/data
+GET  /api/v1/export/hypotheses/{id}/report
+POST /api/v1/local-llm/chat
+GET  /api/v1/realtime/events
 ```
 
 Search requests support bounded cursor pagination, frequency/date ranges, receiver, class, language, confidence, review/status/category, callsign and exact or normalized number group.
@@ -72,3 +83,5 @@ Search requests support bounded cursor pagination, frequency/date ranges, receiv
 ```
 
 Raw audio is never inserted into context. Items contain IDs and PWA permalinks. The server rejects a bundle whose estimated serialized size exceeds the requested token budget.
+
+The local-LLM endpoint is disabled by default, uses a server-side encrypted or environment API key, imposes prompt/output bounds, and returns its result explicitly labeled `LOCAL_LLM_HYPOTHESIS`.

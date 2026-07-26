@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import traceback
 from datetime import UTC, datetime, timedelta
 
+import httpx
+import structlog
 from celery import Task
 from signal_index.database import SessionLocal
+from signal_index.event_bus import publish_event
 from signal_index.ingestion import materialize_record
-from signal_index.models import Source, SourceFetchJob
+from signal_index.models import Receiver, ReceiverStatus, Source, SourceFetchJob
+from signal_index.security import validate_external_url
 from signal_index.storage import ObjectStorage
 from source_adapters.adapters import HTMLTableAdapter, RSSAtomAdapter
 from source_adapters.base import SourceAdapter
 from sqlalchemy import select
 
 from .celery_app import celery
+
+log = structlog.get_logger()
 
 
 @celery.task(bind=True, max_retries=4, name="audio_processor.source_tasks.fetch_source")
@@ -146,3 +153,66 @@ def dispatch_due_sources() -> dict[str, int]:
                 fetch_source.delay(source.id)
                 dispatched += 1
     return {"dispatched": dispatched}
+
+
+@celery.task(name="audio_processor.source_tasks.check_receivers")
+def check_receivers() -> dict[str, int]:
+    checked = 0
+    online = 0
+    with SessionLocal() as db:
+        receiver_ids = list(
+            db.scalars(
+                select(Receiver.id).where(
+                    Receiver.deleted_at.is_(None),
+                ).limit(1_000)
+            )
+        )
+    for receiver_id in receiver_ids:
+        started = time.perf_counter()
+        status = "OFFLINE"
+        detail: dict[str, str] = {}
+        try:
+            with SessionLocal() as db:
+                receiver = db.get(Receiver, receiver_id)
+                if receiver is None:
+                    continue
+                host = receiver.base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+                url = validate_external_url(receiver.base_url, {host.lower()})
+            response = httpx.head(url, timeout=8, follow_redirects=False)
+            status = "ONLINE" if response.status_code < 500 else "OFFLINE"
+            detail["http_status"] = str(response.status_code)
+        except Exception as exc:
+            detail = {"error_type": type(exc).__name__, "error": str(exc)[:500]}
+        latency_ms = round((time.perf_counter() - started) * 1_000, 2)
+        with SessionLocal.begin() as db:
+            receiver = db.get(Receiver, receiver_id)
+            if receiver is None:
+                continue
+            receiver.status = status
+            receiver.last_checked_at = datetime.now(UTC)
+            db.add(
+                ReceiverStatus(
+                    receiver_id=receiver.id,
+                    status=status,
+                    latency_ms=latency_ms,
+                    detail=detail,
+                )
+            )
+        try:
+            publish_event(
+                "receiver_status",
+                {
+                    "receiver_id": receiver_id,
+                    "status": status,
+                    "latency_ms": latency_ms,
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                "realtime_publish_failed",
+                event_type="receiver_status",
+                error_type=type(exc).__name__,
+            )
+        checked += 1
+        online += int(status == "ONLINE")
+    return {"checked": checked, "online": online}

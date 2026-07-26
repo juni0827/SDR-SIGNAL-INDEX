@@ -13,6 +13,7 @@ import structlog
 from celery import Task
 from signal_index.config import get_settings
 from signal_index.database import SessionLocal
+from signal_index.event_bus import publish_event
 from signal_index.models import (
     AudioSegment,
     CaptureJob,
@@ -42,9 +43,21 @@ from .artifacts import spectrogram_png, waveform_json
 from .asr import transcribe
 from .celery_app import celery
 from .grouping import merge_into_session, replace_session_embedding, select_session
+from .runtime_config import active_setting_values, effective_worker_settings
 
 settings = get_settings()
 log = structlog.get_logger()
+
+
+def emit_event(event_type: str, data: dict[str, Any]) -> None:
+    try:
+        publish_event(event_type, data, settings)
+    except Exception as exc:
+        log.warning(
+            "realtime_publish_failed",
+            event_type=event_type,
+            error_type=type(exc).__name__,
+        )
 
 
 def set_job(job_id: str, **values: Any) -> None:
@@ -54,6 +67,14 @@ def set_job(job_id: str, **values: Any) -> None:
             raise RuntimeError(f"processing job {job_id} disappeared")
         for key, value in values.items():
             setattr(job, key, value)
+        event = {
+            "job_id": job.id,
+            "recording_id": job.recording_id,
+            "status": job.status,
+            "stage": job.stage,
+            "progress": job.progress,
+        }
+    emit_event("processing_progress", event)
 
 
 def energy_fallback(samples: np.ndarray, sample_rate: int) -> list[TimeRange]:
@@ -89,20 +110,32 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
             if stored_job is None:
                 raise RuntimeError(f"processing job {job_id} does not exist")
             job_parameters = dict(stored_job.parameters)
+            active_values = active_setting_values(db)
+            runtime_settings = effective_worker_settings(settings, active_values)
         with tempfile.TemporaryDirectory(prefix="signal-index-") as temp_dir:
             root = Path(temp_dir)
             original = root / "original"
             original.write_bytes(storage.download(object_key))
             stage = "METADATA_EXTRACTION"
             set_job(job_id, stage=stage, progress=0.08)
-            metadata = probe(original, settings.FFPROBE_PATH)
+            metadata = probe(original, runtime_settings.FFPROBE_PATH)
             processed = root / "processed.wav"
             stage = "NORMALIZE"
-            normalize_audio(original, processed, PRESETS.get(mode, PRESETS["VOICE"]), settings.FFMPEG_PATH)
+            configured_preset = str(active_values.get("processing.preset", mode)).upper()
+            normalize_audio(
+                original,
+                processed,
+                PRESETS.get(configured_preset, PRESETS.get(mode, PRESETS["VOICE"])),
+                runtime_settings.FFMPEG_PATH,
+            )
             preview = root / "preview.ogg"
-            create_preview(processed, preview, settings.FFMPEG_PATH)
-            processed_key = f"derived/{recording_id}/{settings.PIPELINE_VERSION}/processed.wav"
-            preview_key = f"derived/{recording_id}/{settings.PIPELINE_VERSION}/preview.ogg"
+            create_preview(processed, preview, runtime_settings.FFMPEG_PATH)
+            processed_key = (
+                f"derived/{recording_id}/{runtime_settings.PIPELINE_VERSION}/processed.wav"
+            )
+            preview_key = (
+                f"derived/{recording_id}/{runtime_settings.PIPELINE_VERSION}/preview.ogg"
+            )
             storage.upload(processed_key, processed.read_bytes(), "audio/wav")
             storage.upload(preview_key, preview.read_bytes(), "audio/ogg")
             samples, sample_rate = sf.read(processed, dtype="float32")
@@ -110,26 +143,37 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
             stage = "VAD"
             set_job(job_id, stage=stage, progress=0.25)
             vad_preset = VADPreset(
-                threshold=float(job_parameters.get("threshold", settings.VAD_THRESHOLD)),
+                threshold=float(
+                    job_parameters.get("threshold", runtime_settings.VAD_THRESHOLD)
+                ),
                 minimum_speech_ms=int(
-                    job_parameters.get("minimum_speech_ms", settings.VAD_MINIMUM_SPEECH_MS)
+                    job_parameters.get(
+                        "minimum_speech_ms", runtime_settings.VAD_MINIMUM_SPEECH_MS
+                    )
                 ),
                 minimum_silence_ms=int(
-                    job_parameters.get("minimum_silence_ms", settings.VAD_MINIMUM_SILENCE_MS)
+                    job_parameters.get(
+                        "minimum_silence_ms", runtime_settings.VAD_MINIMUM_SILENCE_MS
+                    )
                 ),
-                padding_ms=int(job_parameters.get("padding_ms", settings.VAD_PADDING_MS)),
+                padding_ms=int(
+                    job_parameters.get("padding_ms", runtime_settings.VAD_PADDING_MS)
+                ),
                 maximum_segment_sec=float(
-                    job_parameters.get("maximum_segment_sec", settings.VAD_MAXIMUM_SEGMENT_SEC)
+                    job_parameters.get(
+                        "maximum_segment_sec", runtime_settings.VAD_MAXIMUM_SEGMENT_SEC
+                    )
                 ),
                 merge_shorter_than_ms=int(
                     job_parameters.get(
-                        "merge_shorter_than_ms", settings.VAD_MERGE_SHORTER_THAN_MS
+                        "merge_shorter_than_ms",
+                        runtime_settings.VAD_MERGE_SHORTER_THAN_MS,
                     )
                 ),
             )
             raw_ranges = (
                 silero_ranges(samples, sample_rate, vad_preset)
-                if settings.SILERO_VAD_ENABLED
+                if runtime_settings.SILERO_VAD_ENABLED
                 else []
             )
             if not raw_ranges:
@@ -157,7 +201,7 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                 recording.ended_at_utc = recording.started_at_utc + timedelta(seconds=metadata.duration_sec)
                 recording.processed_object_key = processed_key
                 recording.preview_object_key = preview_key
-                recording.processing_version = settings.PIPELINE_VERSION
+                recording.processing_version = runtime_settings.PIPELINE_VERSION
                 recording.processing_status = "PROCESSING"
                 if job_parameters.get("replace_active_derivatives"):
                     now = datetime.now(UTC)
@@ -284,7 +328,10 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                     segment_ids.append(segment.id)
                     segment_wav = root / f"{segment.id}.wav"
                     sf.write(segment_wav, audio, sample_rate, subtype="PCM_16")
-                    base_key = f"derived/{recording_id}/{settings.PIPELINE_VERSION}/segments/{segment.id}"
+                    base_key = (
+                        f"derived/{recording_id}/{runtime_settings.PIPELINE_VERSION}"
+                        f"/segments/{segment.id}"
+                    )
                     segment_key = f"{base_key}.wav"
                     waveform_key = f"{base_key}.waveform.json"
                     spectrogram_key = f"{base_key}.spectrogram.png"
@@ -304,11 +351,15 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                             model=audio_embedder.name,
                             model_version=audio_embedder.version,
                             dimension=audio_embedder.dimension,
-                            preprocessing_version=settings.PIPELINE_VERSION,
+                            preprocessing_version=runtime_settings.PIPELINE_VERSION,
                             vector=vector.tolist(),
                         )
                     )
-                    candidates = transcribe(segment_wav) if segment_type in {"VOICE", "UNKNOWN"} else []
+                    candidates = (
+                        transcribe(segment_wav, runtime_settings)
+                        if segment_type in {"VOICE", "UNKNOWN"}
+                        else []
+                    )
                     for candidate_index, candidate in enumerate(candidates):
                         transcript = Transcript(
                             segment_id=segment.id,
@@ -334,7 +385,7 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                                 model=text_embedder.name,
                                 model_version=text_embedder.version,
                                 dimension=text_embedder.dimension,
-                                preprocessing_version=settings.PIPELINE_VERSION,
+                                preprocessing_version=runtime_settings.PIPELINE_VERSION,
                                 vector=text_vector.tolist(),
                             )
                         )
@@ -357,7 +408,7 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                         Provenance(
                             record_type="SEGMENT",
                             record_id=segment.id,
-                            pipeline_version=settings.PIPELINE_VERSION,
+                            pipeline_version=runtime_settings.PIPELINE_VERSION,
                             confidence=confidence,
                             manually_corrected=False,
                         )
@@ -382,7 +433,7 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                     callsigns=callsigns,
                     number_groups=number_groups,
                     composite_vector=composite,
-                    settings=settings,
+                    settings=runtime_settings,
                 )
                 if session_candidate is None:
                     session = TransmissionSession(
@@ -444,7 +495,7 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                         vector=composite,
                         model="composite:torch-spectral+torch-hash-text",
                         model_version="2.0.0",
-                        preprocessing_version=settings.PIPELINE_VERSION,
+                        preprocessing_version=runtime_settings.PIPELINE_VERSION,
                     )
                 recording.processing_status = "COMPLETED"
                 job = db.get(ProcessingJob, job_id)
@@ -466,6 +517,14 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                     )
                     if capture_job.next_run_at is not None:
                         capture_job.status = "SCHEDULED"
+            emit_event(
+                "transcript_completion",
+                {"recording_id": recording_id, "segment_ids": segment_ids},
+            )
+            emit_event(
+                "new_session",
+                {"recording_id": recording_id, "session_id": session.id},
+            )
             return {"recording_id": recording_id, "segment_count": len(segment_ids)}
     except Exception as exc:
         error_code = (
@@ -491,6 +550,15 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                 capture_job.status = "FAILED" if self.request.retries >= self.max_retries else "PROCESSING"
                 capture_job.last_error = error_stderr[-20_000:]
         if self.request.retries >= self.max_retries:
+            emit_event(
+                "failed_job",
+                {
+                    "job_id": job_id,
+                    "recording_id": recording_id,
+                    "stage": stage,
+                    "error_code": error_code,
+                },
+            )
             raise
         raise self.retry(
             exc=exc, countdown=min(300, 2 ** (self.request.retries + 1) * 10)
@@ -537,6 +605,10 @@ def capture_receiver(self: Task, capture_job_id: str) -> dict[str, str]:
             receiver_id = receiver.id
             started_at = datetime.now(UTC)
             capture.status = "CAPTURING"
+        emit_event(
+            "capture_progress",
+            {"capture_job_id": capture_job_id, "status": "CAPTURING", "progress": 0.05},
+        )
         with tempfile.TemporaryDirectory(prefix="signal-index-capture-") as temp_dir:
             output = Path(temp_dir) / "capture.wav"
             run(
@@ -619,6 +691,15 @@ def capture_receiver(self: Task, capture_job_id: str) -> dict[str, str]:
                 capture.status = "PROCESSING"
                 recording_id = recording.id
                 processing_job_id = processing_job.id
+            emit_event(
+                "capture_progress",
+                {
+                    "capture_job_id": capture_job_id,
+                    "recording_id": recording_id,
+                    "status": "PROCESSING",
+                    "progress": 1.0,
+                },
+            )
             process_recording.delay(recording_id, processing_job_id)
         return {"capture_job_id": capture_job_id, "recording_id": recording_id}
     except Exception as exc:
@@ -628,6 +709,14 @@ def capture_receiver(self: Task, capture_job_id: str) -> dict[str, str]:
                 capture.status = "FAILED" if self.request.retries >= self.max_retries else "STARTING"
                 capture.last_error = f"{type(exc).__name__}: {exc}"[-20_000:]
         if self.request.retries >= self.max_retries:
+            emit_event(
+                "failed_job",
+                {
+                    "capture_job_id": capture_job_id,
+                    "stage": "CAPTURE",
+                    "error_code": type(exc).__name__.upper(),
+                },
+            )
             raise
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries)) from exc
     finally:

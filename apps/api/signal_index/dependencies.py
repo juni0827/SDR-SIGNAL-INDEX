@@ -1,3 +1,4 @@
+import secrets
 from typing import Annotated
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request, status
@@ -6,6 +7,7 @@ from sqlalchemy.orm import Session
 from .config import Settings, get_settings
 from .database import get_db
 from .models import User
+from .secrets_store import resolved_secret
 from .security import decode_session_token, require_csrf
 
 DB = Annotated[Session, Depends(get_db)]
@@ -22,7 +24,13 @@ def current_user(
     user_id: str | None = None
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
-        if token == settings.TOOL_API_KEY.get_secret_value():
+        tool_api_key = resolved_secret(
+            db,
+            settings,
+            "tool_api.key",
+            settings.TOOL_API_KEY.get_secret_value(),
+        )
+        if secrets.compare_digest(token, tool_api_key):
             user = db.query(User).filter(User.disabled.is_(False), User.deleted_at.is_(None)).first()
             if user is None:
                 raise HTTPException(status_code=503, detail="initial user is not configured")

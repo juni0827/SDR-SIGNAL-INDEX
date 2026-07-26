@@ -63,8 +63,8 @@ describe("persistence-backed user actions", () => {
       return jsonResponse([]);
     }));
     renderQuery(<SettingsView/>);
-    fireEvent.change(screen.getByPlaceholderText("display.timezone"), { target: { value: "display.timezone" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "Value" }), { target: { value: "Asia/Seoul" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Key" }), { target: { value: "display.timezone" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "JSON or scalar value" }), { target: { value: "Asia/Seoul" } });
     fireEvent.click(screen.getByText("Save new revision"));
     expect(await screen.findByText("Revision stored.")).toBeInTheDocument();
     const post = requests.find(request => request.init?.method === "POST");

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -14,19 +15,27 @@ from sqlalchemy.orm import Session
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..dependencies import CurrentUser
+from ..file_security import detect_file, scan_payload, validate_declared_type
 from ..ingestion import materialize_record
 from ..models import (
+    AuditLog,
     CaptureJob,
+    ExternalEvent,
     FrequencyEntry,
+    GraphLayout,
     Hypothesis,
+    HypothesisHistory,
     InboxItem,
+    Provenance,
     Receiver,
+    ReceiverStatus,
     SavedQuery,
+    SecretRecord,
     SettingRevision,
     Source,
 )
 from ..schemas import Envelope
-from ..security import validate_external_url
+from ..security import encrypt_secret, validate_external_url
 from ..serialization import model_dict
 from ..storage import ObjectStorage
 
@@ -92,6 +101,50 @@ class SourcePatch(BaseModel):
     config: dict[str, Any] | None = None
 
 
+class FrequencyPatch(BaseModel):
+    favorite: bool | None = None
+    watchlisted: bool | None = None
+    notes: str | None = Field(default=None, max_length=100_000)
+
+
+class EventCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=400)
+    event_type: str = Field(min_length=1, max_length=100)
+    started_at_utc: datetime | None = None
+    ended_at_utc: datetime | None = None
+    country_codes: list[str] = Field(default_factory=list, max_length=100)
+    location: dict[str, Any] = Field(default_factory=dict)
+    description: str | None = Field(default=None, max_length=100_000)
+    source_url: str | None = Field(default=None, max_length=2_048)
+    source_name: str | None = Field(default=None, max_length=200)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class EventPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=400)
+    event_type: str | None = Field(default=None, min_length=1, max_length=100)
+    started_at_utc: datetime | None = None
+    ended_at_utc: datetime | None = None
+    country_codes: list[str] | None = Field(default=None, max_length=100)
+    location: dict[str, Any] | None = None
+    description: str | None = Field(default=None, max_length=100_000)
+    source_url: str | None = Field(default=None, max_length=2_048)
+    source_name: str | None = Field(default=None, max_length=200)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class GraphLayoutCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    query_json: dict[str, Any] = Field(default_factory=dict)
+    positions: dict[str, Any] = Field(default_factory=dict)
+    viewport: dict[str, Any] = Field(default_factory=dict)
+
+
+class SecretCreate(BaseModel):
+    key: Literal["local_llm.api_key", "tool_api.key"]
+    value: str = Field(min_length=1, max_length=100_000)
+
+
 def list_model(db: Session, model: type[Any], limit: int) -> list[dict[str, Any]]:
     rows = db.scalars(
         select(model)
@@ -119,6 +172,36 @@ def receiver(receiver_id: str, _user: CurrentUser, db: Session = Depends(get_db)
     return Envelope(data=model_dict(item))
 
 
+@router.get(
+    "/receivers/{receiver_id}/status-history",
+    response_model=Envelope[list[dict[str, Any]]],
+)
+def receiver_status_history(
+    receiver_id: str,
+    _user: CurrentUser,
+    limit: int = Query(default=200, ge=1, le=1_000),
+    db: Session = Depends(get_db),
+) -> Envelope[list[dict[str, Any]]]:
+    item = db.get(Receiver, receiver_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="receiver not found")
+    rows = list(
+        db.scalars(
+            select(ReceiverStatus)
+            .where(
+                ReceiverStatus.receiver_id == receiver_id,
+                ReceiverStatus.deleted_at.is_(None),
+            )
+            .order_by(ReceiverStatus.created_at.desc())
+            .limit(limit)
+        )
+    )
+    return Envelope(
+        data=[model_dict(row) for row in rows],
+        pagination={"limit": limit, "truncated": len(rows) == limit},
+    )
+
+
 @router.get("/frequencies", response_model=Envelope[list[dict[str, Any]]])
 def frequencies(
     _user: CurrentUser,
@@ -126,6 +209,148 @@ def frequencies(
     db: Session = Depends(get_db),
 ) -> Envelope[list[dict[str, Any]]]:
     return Envelope(data=list_model(db, FrequencyEntry, limit), pagination={"limit": limit})
+
+
+@router.patch(
+    "/frequencies/{frequency_id}",
+    response_model=Envelope[dict[str, Any]],
+)
+def patch_frequency(
+    frequency_id: str,
+    payload: FrequencyPatch,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(FrequencyEntry, frequency_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="frequency entry not found")
+    before = {
+        "favorite": item.favorite,
+        "watchlisted": item.watchlisted,
+        "notes": item.notes,
+    }
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(item, key, value)
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="FREQUENCY_UPDATED",
+            target_type="FREQUENCY",
+            target_id=item.id,
+            detail={"before": before, "after": payload.model_dump(exclude_unset=True)},
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(item))
+
+
+@router.get("/events", response_model=Envelope[list[dict[str, Any]]])
+def events(
+    _user: CurrentUser,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> Envelope[list[dict[str, Any]]]:
+    return Envelope(data=list_model(db, ExternalEvent, limit), pagination={"limit": limit})
+
+
+@router.post("/events", response_model=Envelope[dict[str, Any]], status_code=201)
+def create_event(
+    payload: EventCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    if payload.started_at_utc and payload.ended_at_utc:
+        if payload.started_at_utc > payload.ended_at_utc:
+            raise HTTPException(status_code=422, detail="event start must be before end")
+    if payload.source_url:
+        try:
+            validate_external_url(payload.source_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    item = ExternalEvent(**payload.model_dump())
+    db.add(item)
+    db.flush()
+    db.add(
+        Provenance(
+            record_type="EVENT",
+            record_id=item.id,
+            source_url=item.source_url,
+            first_observed_at=datetime.now(UTC),
+            confidence=item.confidence,
+            manually_corrected=True,
+            parser_version="manual-entry",
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="EVENT_CREATED",
+            target_type="EVENT",
+            target_id=item.id,
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(item), provenance=[{"source": "manual user entry"}])
+
+
+@router.get("/events/{event_id}", response_model=Envelope[dict[str, Any]])
+def event(
+    event_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(ExternalEvent, event_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="event not found")
+    provenance = list(
+        db.scalars(
+            select(Provenance).where(
+                Provenance.record_type == "EVENT",
+                Provenance.record_id == item.id,
+                Provenance.deleted_at.is_(None),
+            )
+        )
+    )
+    return Envelope(
+        data=model_dict(item),
+        provenance=[model_dict(row) for row in provenance],
+    )
+
+
+@router.patch("/events/{event_id}", response_model=Envelope[dict[str, Any]])
+def patch_event(
+    event_id: str,
+    payload: EventPatch,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(ExternalEvent, event_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="event not found")
+    changes = payload.model_dump(exclude_unset=True)
+    start = changes.get("started_at_utc", item.started_at_utc)
+    end = changes.get("ended_at_utc", item.ended_at_utc)
+    if start and end and start > end:
+        raise HTTPException(status_code=422, detail="event start must be before end")
+    if source_url := changes.get("source_url"):
+        try:
+            validate_external_url(source_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    before = model_dict(item)
+    for key, value in changes.items():
+        setattr(item, key, value)
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="EVENT_UPDATED",
+            target_type="EVENT",
+            target_id=item.id,
+            detail={"before": before, "after": changes},
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(item))
 
 
 @router.get("/sources", response_model=Envelope[list[dict[str, Any]]])
@@ -301,7 +526,19 @@ def hypothesis(
     item = db.get(Hypothesis, hypothesis_id)
     if item is None or item.deleted_at is not None:
         raise HTTPException(status_code=404, detail="hypothesis not found")
-    return Envelope(data=model_dict(item))
+    history = list(
+        db.scalars(
+            select(HypothesisHistory)
+            .where(
+                HypothesisHistory.hypothesis_id == item.id,
+                HypothesisHistory.deleted_at.is_(None),
+            )
+            .order_by(HypothesisHistory.created_at.desc())
+        )
+    )
+    data = model_dict(item)
+    data["history"] = [model_dict(row) for row in history]
+    return Envelope(data=data)
 
 
 @router.post("/inbox", response_model=Envelope[dict[str, Any]], status_code=201)
@@ -314,6 +551,106 @@ def inbox(payload: InboxCreate, _user: CurrentUser, db: Session = Depends(get_db
     db.add(item)
     db.commit()
     return Envelope(data=model_dict(item))
+
+
+@router.post("/inbox/upload", response_model=Envelope[dict[str, Any]], status_code=201)
+def inbox_upload(
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    item_type: Literal["image", "pdf", "csv", "json", "text", "observation"] = Form(...),
+    frequency_hz: int | None = Form(default=None, ge=0, le=100_000_000_000),
+    mode: str | None = Form(default=None, max_length=20),
+    observed_at_utc: datetime | None = Form(default=None),
+    receiver_id: str | None = Form(default=None),
+    note: str | None = Form(default=None, max_length=100_000),
+    tags: str = Form(default=""),
+    client_id: str | None = Form(default=None, max_length=80),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    if client_id:
+        existing = db.scalar(select(InboxItem).where(InboxItem.client_id == client_id))
+        if existing:
+            return Envelope(data=model_dict(existing), warnings=["idempotent offline replay"])
+    payload = file.file.read(settings.MAX_UPLOAD_BYTES + 1)
+    if not payload:
+        raise HTTPException(status_code=422, detail="uploaded file is empty")
+    if len(payload) > settings.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
+    detected = detect_file(payload)
+    validate_declared_type(detected, item_type)
+    scan_payload(payload, settings)
+    digest = hashlib.sha256(payload).hexdigest()
+    key = f"inbox/{datetime.now(UTC):%Y/%m/%d}/{uuid.uuid4()}/{digest}"
+    storage = ObjectStorage(settings)
+    storage.upload(key, payload, detected.mime_type)
+    item = InboxItem(
+        item_type=item_type,
+        object_key=key,
+        frequency_hz=frequency_hz,
+        mode=mode,
+        observed_at_utc=observed_at_utc or datetime.now(UTC),
+        receiver_id=receiver_id,
+        note=note,
+        tags=[value.strip() for value in tags.split(",") if value.strip()][:100],
+        status="UNCLASSIFIED",
+        client_id=client_id,
+        original_filename=file.filename,
+        mime_type=detected.mime_type,
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+    db.add(item)
+    db.flush()
+    db.add(
+        Provenance(
+            record_type="INBOX_ITEM",
+            record_id=item.id,
+            first_observed_at=item.observed_at_utc,
+            raw_hash=digest,
+            raw_object_key=key,
+            confidence=1.0,
+            manually_corrected=False,
+            parser_version="binary-upload",
+            pipeline_version=settings.PIPELINE_VERSION,
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="INBOX_BINARY_UPLOADED",
+            target_type="INBOX_ITEM",
+            target_id=item.id,
+            detail={"mime_type": detected.mime_type, "size_bytes": len(payload)},
+        )
+    )
+    db.commit()
+    return Envelope(
+        data=model_dict(item),
+        provenance=[{"raw_hash": digest, "object_key": key}],
+    )
+
+
+@router.get("/inbox/{item_id}/media", response_model=Envelope[dict[str, Any]])
+def inbox_media(
+    item_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(InboxItem, item_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="inbox item not found")
+    if not item.object_key:
+        raise HTTPException(status_code=409, detail="inbox item has no binary object")
+    return Envelope(
+        data={
+            "url": ObjectStorage(settings).signed_get_url(item.object_key),
+            "mime_type": item.mime_type,
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+        }
+    )
 
 
 @router.get("/inbox", response_model=Envelope[list[dict[str, Any]]])
@@ -388,6 +725,58 @@ def saved_queries(
     return Envelope(data=list_model(db, SavedQuery, limit), pagination={"limit": limit})
 
 
+@router.get("/graph-layouts", response_model=Envelope[list[dict[str, Any]]])
+def graph_layouts(
+    user: CurrentUser,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> Envelope[list[dict[str, Any]]]:
+    rows = list(
+        db.scalars(
+            select(GraphLayout)
+            .where(
+                GraphLayout.owner_id == user.id,
+                GraphLayout.deleted_at.is_(None),
+            )
+            .order_by(GraphLayout.updated_at.desc())
+            .limit(limit)
+        )
+    )
+    return Envelope(data=[model_dict(row) for row in rows], pagination={"limit": limit})
+
+
+@router.post("/graph-layouts", response_model=Envelope[dict[str, Any]], status_code=201)
+def create_graph_layout(
+    payload: GraphLayoutCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    if len(payload.positions) > 500:
+        raise HTTPException(status_code=422, detail="graph layout is limited to 500 nodes")
+    item = GraphLayout(**payload.model_dump(), owner_id=user.id)
+    db.add(item)
+    db.commit()
+    return Envelope(data=model_dict(item))
+
+
+@router.patch("/graph-layouts/{layout_id}", response_model=Envelope[dict[str, Any]])
+def update_graph_layout(
+    layout_id: str,
+    payload: GraphLayoutCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(GraphLayout, layout_id)
+    if item is None or item.deleted_at is not None or item.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="graph layout not found")
+    if len(payload.positions) > 500:
+        raise HTTPException(status_code=422, detail="graph layout is limited to 500 nodes")
+    for key, value in payload.model_dump().items():
+        setattr(item, key, value)
+    db.commit()
+    return Envelope(data=model_dict(item))
+
+
 @router.post("/settings", response_model=Envelope[dict[str, Any]], status_code=201)
 def setting(
     payload: SettingCreate, user: CurrentUser, db: Session = Depends(get_db)
@@ -415,3 +804,99 @@ def settings(
     db: Session = Depends(get_db),
 ) -> Envelope[list[dict[str, Any]]]:
     return Envelope(data=list_model(db, SettingRevision, limit), pagination={"limit": limit})
+
+
+@router.get("/settings/active", response_model=Envelope[dict[str, Any]])
+def active_settings(
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    rows = list(
+        db.scalars(
+            select(SettingRevision)
+            .where(SettingRevision.deleted_at.is_(None))
+            .order_by(SettingRevision.created_at.desc())
+        )
+    )
+    active: dict[str, Any] = {}
+    revisions: dict[str, str] = {}
+    for row in rows:
+        if row.key not in active:
+            active[row.key] = row.value
+            revisions[row.key] = row.id
+    return Envelope(data={"values": active, "revision_ids": revisions})
+
+
+@router.get("/settings/secrets", response_model=Envelope[list[dict[str, Any]]])
+def secret_status(
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[list[dict[str, Any]]]:
+    rows = list(
+        db.scalars(
+            select(SecretRecord)
+            .where(SecretRecord.deleted_at.is_(None))
+            .order_by(SecretRecord.updated_at.desc())
+        )
+    )
+    return Envelope(
+        data=[
+            {
+                "id": row.id,
+                "key": row.key,
+                "key_version": row.key_version,
+                "updated_at": row.updated_at,
+                "configured": True,
+            }
+            for row in rows
+        ]
+    )
+
+
+@router.post("/settings/secrets", response_model=Envelope[dict[str, Any]])
+def store_secret(
+    payload: SecretCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    item = db.scalar(
+        select(SecretRecord).where(
+            SecretRecord.key == payload.key,
+            SecretRecord.deleted_at.is_(None),
+        )
+    )
+    encrypted = encrypt_secret(
+        payload.value, settings.SECRET_ENCRYPTION_KEY.get_secret_value()
+    )
+    if item is None:
+        item = SecretRecord(
+            key=payload.key,
+            encrypted_value=encrypted,
+            key_version=1,
+            actor_id=user.id,
+        )
+        db.add(item)
+    else:
+        item.encrypted_value = encrypted
+        item.key_version += 1
+        item.actor_id = user.id
+    db.flush()
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="SECRET_ROTATED",
+            target_type="SECRET_RECORD",
+            target_id=item.id,
+            detail={"key": item.key, "key_version": item.key_version},
+        )
+    )
+    db.commit()
+    return Envelope(
+        data={
+            "id": item.id,
+            "key": item.key,
+            "key_version": item.key_version,
+            "configured": True,
+        }
+    )

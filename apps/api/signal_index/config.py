@@ -19,8 +19,17 @@ class Settings(BaseSettings):
     S3_ACCESS_KEY: str = "minio"
     S3_SECRET_KEY: SecretStr = SecretStr("miniosecret")
     S3_SECURE: bool = False
+    S3_MULTIPART_THRESHOLD_BYTES: int = Field(
+        default=16 * 1024 * 1024, ge=5 * 1024 * 1024
+    )
+    S3_MULTIPART_CHUNK_BYTES: int = Field(
+        default=16 * 1024 * 1024, ge=5 * 1024 * 1024
+    )
     SESSION_SECRET: SecretStr = SecretStr("development-session-secret-change-this-value")
     JWT_SECRET: SecretStr = SecretStr("development-jwt-secret-change-this-value")
+    SECRET_ENCRYPTION_KEY: SecretStr = SecretStr(
+        "development-encryption-key-change-this-value"
+    )
     TOOL_API_KEY: SecretStr = SecretStr("development-agent-key-change-this-value")
     FIRST_USER_EMAIL: str = "owner@local.test"
     FIRST_USER_PASSWORD: SecretStr = SecretStr("change-this-password")
@@ -61,8 +70,13 @@ class Settings(BaseSettings):
     MALWARE_SCAN_ENABLED: bool = False
     CLAMAV_HOST: str = "clamav"
     CLAMAV_PORT: int = Field(default=3310, ge=1, le=65535)
+    DEFAULT_RECORDING_RETENTION_DAYS: int = Field(default=3650, ge=1, le=36500)
+    RETENTION_DELETE_DERIVED_OBJECTS: bool = True
+    WEBAUTHN_RP_ID: str = "localhost"
+    WEBAUTHN_RP_NAME: str = "Signal Index"
+    WEBAUTHN_ORIGIN: str = "http://localhost:3000"
 
-    @field_validator("SESSION_SECRET", "JWT_SECRET")
+    @field_validator("SESSION_SECRET", "JWT_SECRET", "SECRET_ENCRYPTION_KEY")
     @classmethod
     def validate_secret(cls, value: SecretStr) -> SecretStr:
         if len(value.get_secret_value()) < 32:

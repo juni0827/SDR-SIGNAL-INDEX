@@ -28,15 +28,16 @@ def summarize_activity(points: list[ActivityPoint]) -> dict[str, object]:
     callsigns = Counter(value for point in ordered for value in point.callsigns)
     numbers = Counter(value for point in ordered for value in point.number_groups)
     cooccurrence = Counter(
-        tuple(sorted((left, right)))
+        (left, right)
         for point in ordered
         for left in point.callsigns
         for right in point.number_groups
     )
     daily = Counter(point.observed_at.date().isoformat() for point in ordered)
-    daily_values = list(daily.values())
+    sorted_daily = sorted(daily.items())
+    daily_values = [value for _, value in sorted_daily]
     rolling_z: list[dict[str, float | str]] = []
-    for index, (day, value) in enumerate(sorted(daily.items())):
+    for index, (day, value) in enumerate(sorted_daily):
         baseline = daily_values[max(0, index - 14) : index]
         if len(baseline) < 3:
             continue
@@ -44,8 +45,18 @@ def summarize_activity(points: list[ActivityPoint]) -> dict[str, object]:
         variance = sum((item - mean) ** 2 for item in baseline) / len(baseline)
         deviation = variance**0.5
         z = (value - mean) / deviation if deviation else 0.0
-        rolling_z.append({"day": day, "z_score": z, "change_point_candidate": abs(z) >= 3})
+        rolling_z.append(
+            {
+                "day": day,
+                "value": float(value),
+                "baseline_mean": mean,
+                "baseline_deviation": float(value) - mean,
+                "z_score": z,
+                "change_point_candidate": abs(z) >= 3,
+            }
+        )
     confidence_buckets = Counter(min(9, int(point.confidence * 10)) for point in ordered)
+    frequency_activity = Counter(point.frequency_hz for point in ordered)
     return {
         "activity_count": len(ordered),
         "active_duration_sec": sum(point.duration_sec for point in ordered),
@@ -53,6 +64,8 @@ def summarize_activity(points: list[ActivityPoint]) -> dict[str, object]:
         "receiver_coverage": len({receiver for point in ordered for receiver in point.receiver_ids}),
         "hourly_seasonality": dict(sorted(hourly.items())),
         "weekly_seasonality": dict(sorted(weekday.items())),
+        "daily_activity": dict(sorted_daily),
+        "frequency_activity_count": dict(frequency_activity.most_common()),
         "callsign_frequency": dict(callsigns.most_common()),
         "number_group_frequency": dict(numbers.most_common()),
         "cooccurrence_matrix": [

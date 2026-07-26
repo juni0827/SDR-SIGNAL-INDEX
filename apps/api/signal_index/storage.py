@@ -4,6 +4,7 @@ import io
 from typing import IO
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 from .config import Settings, get_settings
@@ -35,6 +36,12 @@ class ObjectStorage:
             self.settings.S3_BUCKET,
             key,
             ExtraArgs={"ContentType": mime_type, "ServerSideEncryption": "AES256"},
+            Config=TransferConfig(
+                multipart_threshold=self.settings.S3_MULTIPART_THRESHOLD_BYTES,
+                multipart_chunksize=self.settings.S3_MULTIPART_CHUNK_BYTES,
+                max_concurrency=4,
+                use_threads=True,
+            ),
         )
 
     def download(self, key: str) -> bytes:
@@ -58,3 +65,23 @@ class ObjectStorage:
     def health(self) -> bool:
         self.client.head_bucket(Bucket=self.settings.S3_BUCKET)
         return True
+
+    def usage(self, maximum_objects: int = 100_000) -> dict[str, int | bool]:
+        if not 1 <= maximum_objects <= 1_000_000:
+            raise ValueError("maximum_objects must be between 1 and 1000000")
+        count = 0
+        size_bytes = 0
+        truncated = False
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.settings.S3_BUCKET):
+            for item in page.get("Contents", []):
+                count += 1
+                size_bytes += int(item.get("Size", 0))
+                if count >= maximum_objects:
+                    truncated = True
+                    return {
+                        "object_count": count,
+                        "size_bytes": size_bytes,
+                        "truncated": truncated,
+                    }
+        return {"object_count": count, "size_bytes": size_bytes, "truncated": truncated}

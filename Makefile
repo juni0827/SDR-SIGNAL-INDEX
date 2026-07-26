@@ -3,7 +3,7 @@ PYTHON ?= python3
 COMPOSE ?= docker compose
 PYTHONPATH := apps/api:packages/source_adapters:packages/signal_processing:workers/audio_processor
 
-.PHONY: install infra migrate seed dev test test-integration lint typecheck e2e e2e-stack backup restore
+.PHONY: install infra migrate seed dev test test-integration lint typecheck e2e e2e-stack backup restore benchmark
 
 install:
 	npm install
@@ -51,3 +51,6 @@ backup:
 restore:
 	@test -n "$(BACKUP)" || (echo "Use: make restore BACKUP=/absolute/backup.tar.gz"; exit 2)
 	bash scripts/restore/restore.sh "$(BACKUP)"
+
+benchmark:
+	PYTHONPATH=$(PYTHONPATH) .venv/bin/python scripts/maintenance/benchmark.py --segments 100000 --entities 1000000

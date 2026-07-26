@@ -83,12 +83,12 @@ Every failure records stage, error code, stderr, attempt count, and traceback. T
 
 ## 4. Current implementation status
 
-This repository is a functional, persistence-backed implementation under active completion; it is not represented as satisfying every item in the original fifty-part specification. The source of truth is:
+This repository is a functional, persistence-backed implementation. The formerly shallow product surfaces now have real API, database or object-storage paths: graph exports/layouts, timeline comparison, spectrum watchlists, clustered receiver status, binary inbox, external events, layered hypotheses, requested metadata/report exports, optional passkeys, encrypted secrets, retention scheduling, multipart S3 transfer and Redis-backed realtime updates. The source of truth is:
 
 - [Requirement traceability](docs/TRACEABILITY.md)
 - [Phase completion gates](docs/PHASE_GATES.md)
 
-In particular, a route, model, button, or provider interface is not counted as a completed feature. The release remains partial until the real PostgreSQL/Redis/MinIO/Celery/FFmpeg/faster-whisper stack passes the documented twenty-step end-to-end gate.
+In particular, a route, model, button, or provider interface is not counted as a completed feature. The release is still not called fully verified until a fresh host passes the real PostgreSQL/Redis/MinIO/Celery/FFmpeg/faster-whisper twenty-step end-to-end gate, the scale benchmark and the physical PWA device matrix.
 
 ## 5. Implementation phases
 
@@ -149,6 +149,7 @@ make test
 make test-integration
 make e2e
 make e2e-stack E2E_EXTERNAL_SERVER=1
+make benchmark
 make backup
 make restore BACKUP=/absolute/path/to/signal-index-backup.tar.gz
 ```
@@ -169,6 +170,8 @@ LOCAL_LLM_API_KEY=local
 ```
 
 The API key remains server-side. A browser agent gets predictable routes, semantic landmarks, ARIA labels, `data-testid` selectors, permalinks, URL query state, query JSON, and export controls. Direct structured access uses `Authorization: Bearer $TOOL_API_KEY`.
+
+`POST /api/v1/local-llm/chat` is a bounded server-side convenience path. It is disabled unless `LOCAL_LLM_ENABLED=true`, never returns the configured key, and labels output as a local-LLM hypothesis rather than an observed fact.
 
 ## Processing presets and platform notes
 
@@ -191,8 +194,21 @@ The API key remains server-side. A browser agent gets predictable routes, semant
 - Fetch URL scheme/credential/DNS/private-address validation and explicit host allowlists.
 - Disabled-by-default public source and receiver capture.
 - Structured JSON request/job logs and audit records.
+- Optional passkeys use one-time Redis challenges and WebAuthn verification; password login remains available.
+- UI-managed sensitive values use AES-GCM with `SECRET_ENCRYPTION_KEY`; secret status APIs never return values.
+- Binary inbox inputs are detected from byte signatures, optionally scanned by ClamAV, hashed, and stored privately.
+- Large object writes use bounded S3 multipart transfers; audio is deliberately excluded from automatic PWA caching.
 
 Production requires HTTPS and secrets provided by the deployment platform. Never commit `.env`.
+
+For production passkeys configure the HTTPS relying party:
+
+```dotenv
+WEBAUTHN_RP_ID=signal.example.com
+WEBAUTHN_RP_NAME=Signal Index
+WEBAUTHN_ORIGIN=https://signal.example.com
+SECRET_ENCRYPTION_KEY=<at-least-32-random-characters>
+```
 
 ## Backups
 
@@ -203,6 +219,17 @@ make restore BACKUP=/absolute/path/to/backup.tar.gz
 ```
 
 The restore script verifies checksums before replacing the target database and object data.
+
+## Remaining verification gates
+
+The code and documentation do not turn unavailable infrastructure into a passing result:
+
+- Docker is required to execute PostgreSQL, Redis, MinIO, Celery and the actual faster-whisper vertical path.
+- `make e2e-stack E2E_EXTERNAL_SERVER=1` must pass on that host before release.
+- `make benchmark` must meet the stated latency targets on the intended database hardware.
+- Installation, offline sync/conflict handling, passkeys and audio review require the requested physical-device matrix.
+
+Spectrograms currently use bounded low-resolution PNG previews, an option allowed by the specification, rather than a tiled pyramid. Speaker identity and transmitter-location inference are intentionally outside the product’s claims.
 
 ## Documentation
 

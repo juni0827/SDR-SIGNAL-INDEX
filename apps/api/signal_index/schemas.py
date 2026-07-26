@@ -141,12 +141,19 @@ class HypothesisCreate(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    unresolved_evidence_ids: list[str] = Field(default_factory=list)
     related_session_ids: list[str] = Field(default_factory=list)
     related_event_ids: list[str] = Field(default_factory=list)
+    saved_query_ids: list[str] = Field(default_factory=list)
+    evaluation_notes: str | None = Field(default=None, max_length=100_000)
+    user_notes: str | None = Field(default=None, max_length=100_000)
+    llm_notes: str | None = Field(default=None, max_length=100_000)
     created_by: Literal["USER", "LOCAL_LLM"] = "USER"
 
 
 class HypothesisPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    statement: str | None = Field(default=None, min_length=1, max_length=100_000)
     status: Literal[
         "DRAFT", "ACTIVE", "SUPPORTED", "CONTRADICTED", "INCONCLUSIVE", "ARCHIVED"
     ] | None = None
@@ -154,6 +161,12 @@ class HypothesisPatch(BaseModel):
     evaluation_notes: str | None = Field(default=None, max_length=100_000)
     supporting_evidence_ids: list[str] | None = None
     contradicting_evidence_ids: list[str] | None = None
+    unresolved_evidence_ids: list[str] | None = None
+    related_session_ids: list[str] | None = None
+    related_event_ids: list[str] | None = None
+    saved_query_ids: list[str] | None = None
+    user_notes: str | None = Field(default=None, max_length=100_000)
+    llm_notes: str | None = Field(default=None, max_length=100_000)
 
 
 class AnnotationCreate(BaseModel):
@@ -181,3 +194,11 @@ class CorrelationRequest(BaseModel):
     event_window_before_sec: int = Field(default=0, ge=0, le=31_536_000)
     event_window_after_sec: int = Field(default=86_400, ge=0, le=31_536_000)
     minimum_confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class LocalLLMRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=120)
+    prompt: str = Field(min_length=1, max_length=100_000)
+    context: dict[str, Any] = Field(default_factory=dict)
+    max_tokens: int = Field(default=2_000, ge=1, le=16_000)
+    temperature: float = Field(default=0.2, ge=0, le=2)

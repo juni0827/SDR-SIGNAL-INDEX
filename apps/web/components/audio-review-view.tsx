@@ -47,6 +47,7 @@ export function AudioReviewView({ segmentId }: { segmentId: string }) {
   const [mergeIds, setMergeIds] = useState(segmentId);
   const [annotation, setAnnotation] = useState("");
   const [status, setStatus] = useState("");
+  const [loop, setLoop] = useState(false);
   const row = segment.data?.data;
   const transcripts = useMemo(() => (row?.transcripts as Row[] | undefined) ?? [], [row?.transcripts]);
   const entities = useMemo(() => (row?.entities as Row[] | undefined) ?? [], [row?.entities]);
@@ -91,6 +92,25 @@ export function AudioReviewView({ segmentId }: { segmentId: string }) {
       setPlaying(false);
     }
   };
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      if (event.code === "Space") {
+        event.preventDefault();
+        void toggle();
+      } else if (event.key.toLowerCase() === "a") {
+        setVariant(current => current === "original" ? "processed" : "original");
+      } else if (event.key.toLowerCase() === "l") {
+        setLoop(current => !current);
+      } else if (event.key === "[") {
+        if (audio.current) audio.current.playbackRate = Math.max(0.5, audio.current.playbackRate - 0.25);
+      } else if (event.key === "]") {
+        if (audio.current) audio.current.playbackRate = Math.min(2, audio.current.playbackRate + 0.25);
+      }
+    };
+    window.addEventListener("keydown", keyboard);
+    return () => window.removeEventListener("keydown", keyboard);
+  });
   const setGain = (value: number) => {
     if (!audio.current) return;
     try {
@@ -122,10 +142,17 @@ export function AudioReviewView({ segmentId }: { segmentId: string }) {
         <section className="panel audio">
           <header><div><span className="kicker">SEGMENT · {segmentId}</span><h2>{Number(row.start_sec).toFixed(2)}–{Number(row.end_sec).toFixed(2)} s · {String(row.segment_type)}</h2></div><Layer kind={row.manually_adjusted ? "corrected" : "machine"}/></header>
           <div className="tabs">{(["segment", "processed", "original", "preview"] as const).map(value => <button key={value} aria-pressed={variant === value} onClick={() => setVariant(value)}>{value}</button>)}</div>
-          <audio ref={audio} src={source ?? undefined} preload="metadata" onEnded={() => setPlaying(false)} aria-label="Recording audio"/>
+          <audio ref={audio} src={source ?? undefined} preload="metadata" onLoadedMetadata={() => {
+            if (audio.current && variant !== "segment") audio.current.currentTime = Number(row.start_sec);
+          }} onTimeUpdate={() => {
+            if (!audio.current || !loop) return;
+            const start = variant === "segment" ? 0 : Number(row.start_sec);
+            const end = variant === "segment" ? Number(row.duration_sec) : Number(row.end_sec);
+            if (audio.current.currentTime >= end) audio.current.currentTime = start;
+          }} onEnded={() => setPlaying(false)} aria-label="Recording audio"/>
           <Waveform url={media.data?.data.waveform_url}/>
           {media.data?.data.spectrogram_url ? <object className="spectrogram" data={media.data.data.spectrogram_url} type="image/png" aria-label="Processed segment spectrogram"/> : <div className="spectrogram" aria-label="No spectrogram"/>}
-          <footer className="transport"><button onClick={() => void toggle()} aria-label={playing ? "Pause audio" : "Play audio"}>{playing ? <Pause/> : <Play/>}</button>{[0.75, 1, 1.25, 1.5].map(rate => <button key={rate} onClick={() => { if (audio.current) audio.current.playbackRate = rate; }}>{rate}×</button>)}<label>Gain<input type="range" min=".1" max="2" step=".1" defaultValue="1" onChange={event => setGain(Number(event.target.value))}/></label><button onClick={() => { if (audio.current) audio.current.loop = !audio.current.loop; }}>Loop</button></footer>
+          <footer className="transport"><button onClick={() => void toggle()} aria-label={playing ? "Pause audio" : "Play audio"}>{playing ? <Pause/> : <Play/>}</button>{[0.75, 1, 1.25, 1.5].map(rate => <button key={rate} onClick={() => { if (audio.current) audio.current.playbackRate = rate; }}>{rate}×</button>)}<label>Gain<input type="range" min=".1" max="2" step=".1" defaultValue="1" onChange={event => setGain(Number(event.target.value))}/></label><button aria-pressed={loop} onClick={() => setLoop(current => !current)}>Loop selection</button><button aria-pressed={variant === "preview"} onClick={() => setVariant(current => current === "preview" ? "processed" : "preview")}>Noise reduction preview</button></footer>
           <div className="segment-actions">
             <label>Split at seconds<input aria-label="Split at seconds" value={splitAt} onChange={event => setSplitAt(event.target.value)}/></label>
             <button onClick={() => void action("Split", () => api(`/segments/${encodeURIComponent(segmentId)}/split`, { method: "POST", body: JSON.stringify({ at_sec: Number(splitAt) }) }))}>Split</button>
@@ -138,7 +165,7 @@ export function AudioReviewView({ segmentId }: { segmentId: string }) {
         </section>
         <section className="panel transcript">
           <header><div><span className="kicker">TRANSCRIPT CANDIDATES · {transcripts.length}</span><h2>Evidence-preserving correction</h2></div><b>{Math.round(Number((transcripts.find(value => value.is_preferred) ?? transcripts[0])?.confidence ?? 0) * 100)}%</b></header>
-          <div className="cards">{transcripts.map(candidate => <article key={String(candidate.id)}><Layer kind={candidate.transcript_type === "MACHINE" || candidate.transcript_type === "ALTERNATIVE" ? "machine" : "corrected"}/><b>{String(candidate.model_version || candidate.transcript_type)}</b><p>{String(candidate.text)}</p></article>)}</div>
+          <div className="cards">{transcripts.map(candidate => <article key={String(candidate.id)}><Layer kind={candidate.transcript_type === "MACHINE" || candidate.transcript_type === "ALTERNATIVE" ? "machine" : "corrected"}/><b>{String(candidate.model_version || candidate.transcript_type)}</b><p>{String(candidate.text)}</p><button disabled={Boolean(candidate.is_preferred)} onClick={() => void action("Select transcript", () => api(`/transcripts/${encodeURIComponent(String(candidate.id))}/preferred`, { method: "PATCH", body: "{}" }))}>{candidate.is_preferred ? "Preferred" : "Make preferred"}</button></article>)}</div>
           <textarea data-testid="transcript-editor" aria-label="Transcript correction" value={text} onChange={event => setText(event.target.value)}/>
           <label>Language<input value={language} onChange={event => setLanguage(event.target.value)}/></label>
           <div className="entities">{entities.map(entity => <button key={String(entity.id)}>{String(entity.entity_type)} · {String(entity.raw_value)} → {String(entity.normalized_value)}</button>)}</div>
@@ -149,6 +176,7 @@ export function AudioReviewView({ segmentId }: { segmentId: string }) {
           <h3>Word timestamps</h3>
           <div className="cards">{((transcripts.find(value => value.is_preferred)?.word_timestamps as Row[] | undefined) ?? []).map((word, index) => <button key={`${String(word.word)}-${index}`} onClick={() => { if (audio.current) audio.current.currentTime = Number(word.start); }}>{String(word.word)} · {Number(word.start).toFixed(2)}s</button>)}</div>
         </section>
+        <aside className="panel review-context"><span className="kicker">REVIEW CONTEXT</span><h2>Entities</h2>{entities.map(entity => <p key={String(entity.id)}><b>{String(entity.entity_type)}</b><br/>{String(entity.raw_value)} → {String(entity.normalized_value)}</p>)}<h2>Keyboard</h2><dl><dt>Space</dt><dd>Play/pause</dd><dt>A</dt><dd>Original/processed</dd><dt>L</dt><dd>Loop selection</dd><dt>[ / ]</dt><dd>Playback speed</dd></dl><p className="policy">Acoustic similarity is not speaker identity.</p></aside>
       </div> : null}
     </DataState>
   );

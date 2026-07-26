@@ -393,6 +393,38 @@ class InboxItem(RecordMixin, Base):
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(30), default="UNCLASSIFIED")
     client_id: Mapped[str | None] = mapped_column(String(80), unique=True)
+    original_filename: Mapped[str | None] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(String(120))
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+
+
+class GraphLayout(RecordMixin, Base):
+    __tablename__ = "graph_layouts"
+    name: Mapped[str] = mapped_column(String(200), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    query_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    positions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    viewport: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class SecretRecord(RecordMixin, Base):
+    __tablename__ = "secret_records"
+    key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    encrypted_value: Mapped[str] = mapped_column(Text)
+    key_version: Mapped[int] = mapped_column(Integer, default=1)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+
+
+class WebAuthnCredential(RecordMixin, Base):
+    __tablename__ = "webauthn_credentials"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    credential_id: Mapped[str] = mapped_column(Text, unique=True)
+    public_key: Mapped[str] = mapped_column(Text)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0)
+    transports: Mapped[list[str]] = mapped_column(JSON, default=list)
+    name: Mapped[str] = mapped_column(String(200), default="Passkey")
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SettingRevision(RecordMixin, Base):

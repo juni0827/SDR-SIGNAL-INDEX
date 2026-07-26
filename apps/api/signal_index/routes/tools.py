@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
 import zipfile
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from signal_processing.analytics import ActivityPoint, summarize_activity
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
@@ -18,15 +20,20 @@ from ..dependencies import CurrentUser
 from ..models import (
     Annotation,
     AudioSegment,
+    CaptureJob,
     Embedding,
     ExternalEvent,
     ExtractedEntity,
     Hypothesis,
     HypothesisHistory,
+    InboxItem,
+    ProcessingJob,
     Provenance,
+    Receiver,
     Recording,
     Relation,
     Revision,
+    SavedQuery,
     Transcript,
     TransmissionSession,
 )
@@ -37,6 +44,7 @@ from ..schemas import (
     Envelope,
     HypothesisCreate,
     HypothesisPatch,
+    LocalLLMRequest,
     RelationCreate,
     SearchRequest,
     SegmentClassification,
@@ -45,6 +53,7 @@ from ..schemas import (
     SegmentSplit,
     TranscriptCorrection,
 )
+from ..secrets_store import resolved_secret
 from ..serialization import model_dict
 from ..services import (
     context_bundle,
@@ -61,6 +70,76 @@ router = APIRouter(tags=["local LLM tools"])
 
 def missing(name: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"{name} not found")
+
+
+@router.post("/local-llm/chat", response_model=Envelope[dict[str, Any]])
+def local_llm_chat(
+    payload: LocalLLMRequest,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    if not settings.LOCAL_LLM_ENABLED:
+        raise HTTPException(status_code=409, detail="local LLM integration is disabled")
+    if not settings.LOCAL_LLM_MODEL:
+        raise HTTPException(status_code=503, detail="LOCAL_LLM_MODEL is not configured")
+    api_key = resolved_secret(
+        db,
+        settings,
+        "local_llm.api_key",
+        settings.LOCAL_LLM_API_KEY.get_secret_value(),
+    )
+    body = {
+        "model": settings.LOCAL_LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are analyzing Signal Index evidence. Distinguish observed facts, "
+                    "machine results, user interpretation, and hypotheses. Do not infer causality "
+                    "from temporal order."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": payload.task,
+                        "prompt": payload.prompt,
+                        "context": payload.context,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        ],
+        "max_tokens": payload.max_tokens,
+        "temperature": payload.temperature,
+    }
+    try:
+        response = httpx.post(
+            f"{settings.LOCAL_LLM_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=120,
+        )
+        response.raise_for_status()
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="local LLM endpoint failed") from exc
+    return Envelope(
+        data={
+            "task": payload.task,
+            "content": content,
+            "model": result.get("model", settings.LOCAL_LLM_MODEL),
+            "layer": "LOCAL_LLM_HYPOTHESIS",
+        },
+        query={"task": payload.task, "max_tokens": payload.max_tokens},
+        warnings=[
+            "This is local-LLM generated analysis, not an observed fact. It does not overwrite source records."
+        ],
+    )
 
 
 @router.post("/search/sessions", response_model=Envelope[list[dict[str, Any]]])
@@ -340,6 +419,41 @@ def correct_transcript(
         data=model_dict(transcript),
         warnings=["machine candidates were preserved and were not overwritten"],
     )
+
+
+@router.patch("/transcripts/{transcript_id}/preferred", response_model=Envelope[dict[str, Any]])
+def prefer_transcript(
+    transcript_id: str,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    transcript = db.get(Transcript, transcript_id)
+    if transcript is None or transcript.deleted_at is not None:
+        raise missing("transcript")
+    candidates = list(
+        db.scalars(
+            select(Transcript).where(
+                Transcript.segment_id == transcript.segment_id,
+                Transcript.deleted_at.is_(None),
+            )
+        )
+    )
+    previous = next((row.id for row in candidates if row.is_preferred), None)
+    for candidate in candidates:
+        candidate.is_preferred = candidate.id == transcript.id
+    db.add(
+        Revision(
+            record_type="SEGMENT",
+            record_id=transcript.segment_id,
+            actor_type="USER",
+            actor_id=user.id,
+            before={"preferred_transcript_id": previous},
+            after={"preferred_transcript_id": transcript.id},
+            reason="preferred transcript candidate selected",
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(transcript))
 
 
 def replace_session_segment_ids(
@@ -807,10 +921,15 @@ def create_hypothesis(
         confidence=payload.confidence,
         supporting_evidence_ids=payload.supporting_evidence_ids,
         contradicting_evidence_ids=payload.contradicting_evidence_ids,
+        unresolved_evidence_ids=payload.unresolved_evidence_ids,
         related_session_ids=payload.related_session_ids,
         related_event_ids=payload.related_event_ids,
+        saved_query_ids=payload.saved_query_ids,
         created_by_type=payload.created_by,
         created_by_user_id=user.id if payload.created_by == "USER" else None,
+        evaluation_notes=payload.evaluation_notes,
+        user_notes=payload.user_notes,
+        llm_notes=payload.llm_notes,
     )
     db.add(hypothesis)
     db.flush()
@@ -925,9 +1044,29 @@ def evidence_bundle(
     session = db.get(TransmissionSession, session_id)
     if session is None or session.deleted_at is not None:
         raise missing("session")
+    recordings = list(
+        db.scalars(
+            select(Recording).where(
+                Recording.id.in_(session.recording_ids),
+                Recording.deleted_at.is_(None),
+            )
+        )
+    )
+    annotations = list(
+        db.scalars(
+            select(Annotation).where(
+                Annotation.target_id.in_([session.id, *session.segment_ids]),
+                Annotation.deleted_at.is_(None),
+            )
+        )
+    )
     data = {
         "query": {"session_id": session_id},
-        "selected_records": {"session": model_dict(session)},
+        "generated_at_utc": datetime.now(UTC),
+        "selected_records": {
+            "session": model_dict(session),
+            "recordings": [model_dict(row) for row in recordings],
+        },
         "provenance": record_provenance(db, "SESSION", session_id),
         "relations": [
             model_dict(row)
@@ -946,8 +1085,10 @@ def evidence_bundle(
                 )
             )
         ],
+        "notes": [model_dict(row) for row in annotations],
+        "hashes": [{"recording_id": row.id, "sha256": row.sha256} for row in recordings],
         "app_version": "0.1.0",
-        "schema_version": "0001",
+        "schema_version": "0003",
     }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -961,6 +1102,165 @@ def evidence_bundle(
         buffer,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="signal-index-{session_id}.zip"'},
+    )
+
+
+EXPORT_MODELS: dict[str, type[Any]] = {
+    "sessions": TransmissionSession,
+    "segments": AudioSegment,
+    "recordings": Recording,
+    "entities": ExtractedEntity,
+    "relations": Relation,
+    "events": ExternalEvent,
+    "hypotheses": Hypothesis,
+    "annotations": Annotation,
+    "saved_queries": SavedQuery,
+    "inbox": InboxItem,
+    "receivers": Receiver,
+}
+
+
+@router.get("/export/data")
+def export_data(
+    _user: CurrentUser,
+    record_type: str = Query(pattern="^[a-z_]+$"),
+    format: str = Query(pattern="^(json|jsonl|csv|markdown)$"),  # noqa: A002
+    ids: str | None = Query(default=None, max_length=20_000),
+    limit: int = Query(default=10_000, ge=1, le=100_000),
+    db: Session = Depends(get_db),
+) -> Response:
+    model = EXPORT_MODELS.get(record_type)
+    if model is None:
+        raise HTTPException(status_code=422, detail="unsupported export record_type")
+    requested_ids = [value.strip() for value in (ids or "").split(",") if value.strip()]
+    statement = select(model).where(model.deleted_at.is_(None))
+    if requested_ids:
+        if len(requested_ids) > 5_000:
+            raise HTTPException(status_code=422, detail="selective export is limited to 5000 ids")
+        statement = statement.where(model.id.in_(requested_ids))
+    rows = list(db.scalars(statement.order_by(model.created_at).limit(limit)))
+    data = [model_dict(row) for row in rows]
+    meta = {
+        "record_type": record_type,
+        "ids": requested_ids,
+        "limit": limit,
+        "row_count": len(data),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "schema_version": "0003",
+    }
+    filename = f"signal-index-{record_type}.{format if format != 'markdown' else 'md'}"
+    if format == "json":
+        body = json.dumps({"query": meta, "data": data}, default=str, ensure_ascii=False, indent=2)
+        media_type = "application/json"
+    elif format == "jsonl":
+        body = "\n".join(json.dumps(row, default=str, ensure_ascii=False) for row in data) + "\n"
+        media_type = "application/x-ndjson"
+    elif format == "csv":
+        columns = sorted({key for row in data for key in row})
+        target = io.StringIO()
+        writer = csv.DictWriter(target, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in data:
+            writer.writerow(
+                {
+                    key: (
+                        json.dumps(value, default=str, ensure_ascii=False)
+                        if isinstance(value, dict | list)
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+            )
+        body = target.getvalue()
+        media_type = "text/csv"
+    else:
+        lines = [
+            f"# Signal Index {record_type.replace('_', ' ').title()} Export",
+            "",
+            f"- Generated: {meta['generated_at_utc']}",
+            f"- Records: {len(data)}",
+            "- Statistical or temporal association does not imply causation.",
+            "",
+        ]
+        for row in data:
+            lines.extend(
+                [
+                    f"## {row.get('title') or row.get('name') or row.get('id')}",
+                    "",
+                    "```json",
+                    json.dumps(row, default=str, ensure_ascii=False, indent=2),
+                    "```",
+                    "",
+                ]
+            )
+        body = "\n".join(lines)
+        media_type = "text/markdown"
+    return Response(
+        body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export/hypotheses/{hypothesis_id}/report")
+def hypothesis_report(
+    hypothesis_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Response:
+    hypothesis = db.get(Hypothesis, hypothesis_id)
+    if hypothesis is None or hypothesis.deleted_at is not None:
+        raise missing("hypothesis")
+    history = list(
+        db.scalars(
+            select(HypothesisHistory)
+            .where(
+                HypothesisHistory.hypothesis_id == hypothesis.id,
+                HypothesisHistory.deleted_at.is_(None),
+            )
+            .order_by(HypothesisHistory.created_at)
+        )
+    )
+    lines = [
+        f"# {hypothesis.title}",
+        "",
+        f"**Status:** {hypothesis.status}",
+        f"**Confidence:** {hypothesis.confidence if hypothesis.confidence is not None else 'unscored'}",
+        f"**Origin:** {hypothesis.created_by_type}",
+        "",
+        "## Statement",
+        "",
+        hypothesis.statement,
+        "",
+        "## Evidence",
+        "",
+        f"- Supporting: {', '.join(hypothesis.supporting_evidence_ids) or 'None'}",
+        f"- Contradicting: {', '.join(hypothesis.contradicting_evidence_ids) or 'None'}",
+        f"- Unresolved: {', '.join(hypothesis.unresolved_evidence_ids) or 'None'}",
+        "",
+        "## Evaluation history",
+        "",
+    ]
+    lines.extend(
+        f"- {row.created_at.isoformat()}: {row.previous_status or 'NEW'} → {row.new_status}"
+        + (f" — {row.notes}" if row.notes else "")
+        for row in history
+    )
+    lines.extend(
+        [
+            "",
+            "## Interpretation boundary",
+            "",
+            "This report records a user interpretation or local-LLM draft. "
+            "Temporal or statistical association is not a causal claim.",
+        ]
+    )
+    return Response(
+        "\n".join(lines),
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="hypothesis-{hypothesis.id}.md"'
+        },
     )
 
 
@@ -1179,6 +1479,7 @@ def graph_data(
 def analytics_summary(
     _user: CurrentUser,
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> Envelope[dict[str, Any]]:
     session_count = int(
         db.scalar(
@@ -1234,6 +1535,38 @@ def analytics_summary(
             .limit(5)
         ).all()
         top_entities[key] = [{"value": value, "count": count} for value, count in rows]
+    failed_jobs = list(
+        db.scalars(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.status == "FAILED",
+                ProcessingJob.deleted_at.is_(None),
+            )
+            .order_by(ProcessingJob.updated_at.desc())
+            .limit(10)
+        )
+    )
+    capture_status: dict[str, int] = {
+        str(status): int(count)
+        for status, count in db.execute(
+            select(CaptureJob.status, func.count(CaptureJob.id))
+            .where(CaptureJob.deleted_at.is_(None))
+            .group_by(CaptureJob.status)
+        ).all()
+    }
+    receiver_status: dict[str, int] = {
+        str(status): int(count)
+        for status, count in db.execute(
+            select(Receiver.status, func.count(Receiver.id))
+            .where(Receiver.deleted_at.is_(None))
+            .group_by(Receiver.status)
+        ).all()
+    }
+    storage: dict[str, Any]
+    try:
+        storage = {"status": "available", **ObjectStorage(settings).usage(maximum_objects=100_000)}
+    except Exception as exc:
+        storage = {"status": "unavailable", "error_type": type(exc).__name__}
     return Envelope(
         data={
             "session_count": session_count,
@@ -1241,6 +1574,10 @@ def analytics_summary(
             "active_duration_sec": active_duration_sec,
             "receiver_coverage": receiver_coverage,
             **top_entities,
+            "failed_jobs": [model_dict(row) for row in failed_jobs],
+            "capture_status": capture_status,
+            "receiver_status": receiver_status,
+            "storage": storage,
             "mean_session_confidence": (
                 sum(confidence_rows) / len(confidence_rows) if confidence_rows else None
             ),
@@ -1257,6 +1594,8 @@ def analytics_activity(
     end_at_utc: datetime,
     frequency_min_hz: int | None = Query(default=None, ge=0),
     frequency_max_hz: int | None = Query(default=None, ge=0),
+    receiver_id: str | None = None,
+    mode: str | None = Query(default=None, max_length=20),
     db: Session = Depends(get_db),
 ) -> Envelope[dict[str, Any]]:
     if start_at_utc >= end_at_utc:
@@ -1269,6 +1608,29 @@ def analytics_activity(
         filters.append(TransmissionSession.primary_frequency_hz >= frequency_min_hz)
     if frequency_max_hz is not None:
         filters.append(TransmissionSession.primary_frequency_hz <= frequency_max_hz)
+    if receiver_id:
+        filters.append(TransmissionSession.receiver_ids.cast(String).ilike(f"%{receiver_id}%"))
+    if mode:
+        matching_recording_ids = list(
+            db.scalars(
+                select(Recording.id)
+                .where(
+                    Recording.mode == mode.upper(),
+                    Recording.deleted_at.is_(None),
+                )
+                .limit(5_000)
+            )
+        )
+        filters.append(
+            or_(
+                *[
+                    TransmissionSession.recording_ids.cast(String).ilike(f"%{recording_id}%")
+                    for recording_id in matching_recording_ids
+                ]
+            )
+            if matching_recording_ids
+            else TransmissionSession.id == "__none__"
+        )
     sessions = list(
         db.scalars(
             select(TransmissionSession)
@@ -1289,13 +1651,40 @@ def analytics_activity(
         )
         for session in sessions
     ]
+    summary = summarize_activity(points)
+    follow_up_delays = list(
+        db.scalars(
+            select(Relation.delta_seconds).where(
+                Relation.predicate.in_(["PRECEDES", "FOLLOWS", "TEMPORALLY_PRECEDES"]),
+                Relation.delta_seconds.is_not(None),
+                Relation.deleted_at.is_(None),
+                Relation.created_at.between(start_at_utc, end_at_utc),
+            )
+        )
+    )
+    multi_receiver = sum(len(set(session.receiver_ids)) > 1 for session in sessions)
+    summary.update(
+        {
+            "follow_up_event_delay_distribution_sec": [
+                float(value) for value in follow_up_delays if value is not None
+            ],
+            "source_agreement": {
+                "multi_receiver_session_count": multi_receiver,
+                "session_count": len(sessions),
+                "ratio": multi_receiver / len(sessions) if sessions else None,
+                "definition": "share of grouped sessions observed by more than one receiver",
+            },
+        }
+    )
     return Envelope(
-        data=summarize_activity(points),
+        data=summary,
         query={
             "start_at_utc": start_at_utc,
             "end_at_utc": end_at_utc,
             "frequency_min_hz": frequency_min_hz,
             "frequency_max_hz": frequency_max_hz,
+            "receiver_id": receiver_id,
+            "mode": mode,
         },
         pagination={"rows_analyzed": len(points), "truncated": len(points) == 100_000},
         warnings=["Statistical relationships and change candidates are not causal claims."],

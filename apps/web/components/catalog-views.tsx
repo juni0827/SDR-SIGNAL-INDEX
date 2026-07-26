@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -46,11 +46,19 @@ export function DashboardView() {
   const sessions = useApi<Row[]>(["dashboard-sessions"], "/search/sessions", { method: "POST", body: JSON.stringify({ limit: 8 }) });
   const receivers = useApi<Row[]>(["dashboard-receivers"], "/receivers?limit=100");
   const hypotheses = useApi<Row[]>(["dashboard-hypotheses"], "/hypotheses?limit=5");
-  const error = analytics.error || sessions.error || receivers.error || hypotheses.error;
+  const frequencies = useApi<Row[]>(["dashboard-frequencies"], "/frequencies?limit=500");
+  const captures = useApi<Row[]>(["dashboard-captures"], "/capture?limit=20");
+  const savedQueries = useApi<Row[]>(["dashboard-saved-queries"], "/saved-queries?limit=10");
+  const health = useApi<Row>(["dashboard-health"], "/health");
+  const error = analytics.error || sessions.error || receivers.error || hypotheses.error || frequencies.error || captures.error || savedQueries.error || health.error;
   const summary = analytics.data?.data ?? {};
   const sessionRows = sessions.data?.data ?? [];
   const receiverRows = receivers.data?.data ?? [];
   const hypothesisRows = hypotheses.data?.data ?? [];
+  const watchlist = (frequencies.data?.data ?? []).filter(row => row.watchlisted);
+  const failedJobs = (summary.failed_jobs as Row[] | undefined) ?? [];
+  const storage = (summary.storage as Row | undefined) ?? {};
+  const components = (health.data?.data.components as Row | undefined) ?? {};
   return (
     <DataState loading={analytics.isLoading || sessions.isLoading} error={error} empty={false}>
       <div className="dashboard" data-testid="dashboard-live">
@@ -60,12 +68,18 @@ export function DashboardView() {
             ["Active duration", `${Math.round(Number(summary.active_duration_sec ?? 0))} s`],
             ["Receiver coverage", summary.receiver_coverage ?? receiverRows.length],
             ["Unreviewed", sessionRows.filter(row => row.status === "UNREVIEWED").length],
+            ["Storage", storage.size_bytes != null ? `${(Number(storage.size_bytes) / 1_048_576).toFixed(1)} MiB` : String(storage.status ?? "unknown")],
+            ["Worker", String((components.worker as Row | undefined)?.status ?? "unknown")],
           ].map(([label, value]) => <article key={String(label)}><span>{String(label)}</span><b>{String(value)}</b><small>Live indexed value</small></article>)}
         </section>
         <section className="panel recent"><header><div><span className="kicker">RECENT SESSIONS</span><h2>Indexed transmissions</h2></div><Link href="/sessions">View all</Link></header>{sessionRows.length ? <SessionTable rows={sessionRows}/> : <p className="notice">No sessions have been processed.</p>}</section>
         <aside className="panel watch"><span className="kicker">RECEIVERS</span><h2>Status</h2>{receiverRows.length ? receiverRows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><small>{String(row.receiver_type)} · {String(row.status)}</small></div></Link>) : <p>No receivers registered.</p>}</aside>
         <aside className="panel entities"><span className="kicker">REPEATED ENTITIES</span><h2>Current index</h2><p><Layer kind="machine"/><b>{String((summary.top_callsigns as Row[] | undefined)?.[0]?.value ?? "None")}</b></p><p><Layer kind="machine"/><b>{String((summary.top_number_groups as Row[] | undefined)?.[0]?.value ?? "None")}</b></p></aside>
+        <aside className="panel failures"><span className="kicker">PROCESSING FAILURES</span><h2>Action required</h2>{failedJobs.length ? failedJobs.map(row => <p key={String(row.id)}><i/><b>{String(row.stage)}</b><br/>{String(row.error_code ?? row.error_stderr ?? "Failed")}</p>) : <p>No failed jobs.</p>}</aside>
+        <aside className="panel watch"><span className="kicker">WATCHLIST</span><h2>Frequencies</h2>{watchlist.length ? watchlist.slice(0, 8).map(row => <Link href={`/frequencies/${String(row.frequency_hz)}`} key={String(row.id)}><div><b>{formatFrequency(row.frequency_hz)}</b><small>{String(row.label)}</small></div></Link>) : <p>No watchlisted frequencies.</p>}</aside>
+        <aside className="panel failures"><span className="kicker">RECENT CAPTURE</span><h2>Scheduler</h2>{(captures.data?.data ?? []).slice(0, 5).map(row => <p key={String(row.id)}><b>{formatFrequency(row.frequency_hz)}</b><br/>{String(row.status)}</p>)}</aside>
         <aside className="panel failures"><span className="kicker">HYPOTHESES</span><h2>Recent</h2>{hypothesisRows.length ? hypothesisRows.map(row => <p key={String(row.id)}><Link href={`/hypotheses/${String(row.id)}`}>{String(row.title)}</Link></p>) : <p>No hypotheses.</p>}</aside>
+        <aside className="panel failures"><span className="kicker">SAVED QUERIES</span><h2>Reusable</h2>{(savedQueries.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.name)}</b><br/>{String(row.query_type)}</p>)}</aside>
       </div>
     </DataState>
   );
@@ -120,6 +134,8 @@ export function RecordingDetailView({ id }: { id: string }) {
 }
 
 export function FrequenciesView({ frequency }: { frequency?: number }) {
+  const client = useQueryClient();
+  const [mode, setMode] = useState("");
   const activityWindow = useMemo(() => {
     const end = new Date();
     return {
@@ -129,15 +145,25 @@ export function FrequenciesView({ frequency }: { frequency?: number }) {
   }, []);
   const catalog = useApi<Row[]>(["frequencies"], "/frequencies?limit=500");
   const activity = useApi<Row>(
-    ["frequency-activity", frequency],
+    ["frequency-activity", frequency, mode],
     frequency
       ? `/frequencies/${frequency}/activity?tolerance_hz=0`
-      : `/analytics/activity?start_at_utc=${encodeURIComponent(activityWindow.start)}&end_at_utc=${encodeURIComponent(activityWindow.end)}`,
+      : `/analytics/activity?start_at_utc=${encodeURIComponent(activityWindow.start)}&end_at_utc=${encodeURIComponent(activityWindow.end)}${mode ? `&mode=${encodeURIComponent(mode)}` : ""}`,
   );
+  const update = useMutation({
+    mutationFn: ({ id, watchlisted, favorite }: { id: string; watchlisted: boolean; favorite: boolean }) =>
+      api(`/frequencies/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ watchlisted, favorite }),
+      }),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["frequencies"] }),
+  });
   const rows = catalog.data?.data ?? [];
+  const frequencyCounts = (activity.data?.data.frequency_activity_count as Record<string, number> | undefined) ?? {};
+  const maxCount = Math.max(1, ...Object.values(frequencyCounts));
   return (
     <DataState loading={catalog.isLoading || activity.isLoading} error={catalog.error || activity.error} empty={!frequency && rows.length === 0}>
-      <div className="split"><section className="panel full"><header><h2>{frequency ? formatFrequency(frequency) : "Known frequency index"}</h2></header><div className="cards">{rows.map(row => <Link href={`/frequencies/${String(row.frequency_hz)}`} key={String(row.id)}><Layer kind="observed"/><h2>{formatFrequency(row.frequency_hz)}</h2><p>{String(row.label)} · {String(row.category)} · {String(row.mode || "mode unknown")}</p></Link>)}</div></section><aside className="panel inspector"><span className="kicker">ACTIVITY</span><h2>{frequency ? formatFrequency(frequency) : "All bands"}</h2><pre>{JSON.stringify(activity.data?.data ?? {}, null, 2)}</pre></aside></div>
+      <div className="split"><section className="panel full"><header><h2>{frequency ? formatFrequency(frequency) : "Known frequency index"}</h2>{!frequency ? <label>Mode filter<select value={mode} onChange={event => setMode(event.target.value)}><option value="">All</option>{["AM","USB","LSB","CW"].map(value => <option key={value}>{value}</option>)}</select></label> : null}</header>{!frequency ? <div className="frequency-heatmap" aria-label="Frequency activity heatmap">{Object.entries(frequencyCounts).map(([hz, count]) => <Link href={`/frequencies/${hz}`} key={hz} title={`${formatFrequency(hz)} · ${count} sessions`} style={{ height: `${18 + count / maxCount * 100}px` }}><span>{formatFrequency(hz)}</span><b>{count}</b></Link>)}</div> : null}<div className="cards">{rows.map(row => <article key={String(row.id)}><Link href={`/frequencies/${String(row.frequency_hz)}`}><Layer kind="observed"/><h2>{formatFrequency(row.frequency_hz)}</h2><p>{String(row.label)} · {String(row.category)} · {String(row.mode || "mode unknown")}</p></Link><div className="card-actions"><button aria-label={`Watch ${String(row.label)}`} onClick={() => update.mutate({ id: String(row.id), watchlisted: !Boolean(row.watchlisted), favorite: Boolean(row.favorite) })}>{row.watchlisted ? "Watching" : "Watch"}</button><button aria-label={`Favorite ${String(row.label)}`} onClick={() => update.mutate({ id: String(row.id), watchlisted: Boolean(row.watchlisted), favorite: !Boolean(row.favorite) })}>{row.favorite ? "★ Favorite" : "☆ Favorite"}</button></div></article>)}</div></section><aside className="panel inspector"><span className="kicker">ACTIVITY</span><h2>{frequency ? formatFrequency(frequency) : "All bands"}</h2><pre>{JSON.stringify(activity.data?.data ?? {}, null, 2)}</pre></aside></div>
     </DataState>
   );
 }
@@ -150,14 +176,35 @@ function ReceiverMap({ rows }: { rows: Row[] }) {
     void import("maplibre-gl").then(({ default: maplibre }) => {
       if (disposed || !ref.current) return;
       map = new maplibre.Map({ container: ref.current, center: [20, 20], zoom: 1.1, style: { version: 8, sources: {}, layers: [{ id: "background", type: "background", paint: { "background-color": "#081311" } }] } });
-      for (const row of rows) {
-        if (row.latitude == null || row.longitude == null) continue;
-        const element = document.createElement("a");
-        element.className = "receiver-dot";
-        element.setAttribute("aria-label", `${String(row.name)} receiver location`);
-        element.setAttribute("href", `/receivers/${String(row.id)}`);
-        new maplibre.Marker({ element }).setLngLat([Number(row.longitude), Number(row.latitude)]).addTo(map);
-      }
+      const featureCollection = {
+        type: "FeatureCollection" as const,
+        features: rows.filter(row => row.latitude != null && row.longitude != null).map(row => ({
+          type: "Feature" as const,
+          geometry: { type: "Point" as const, coordinates: [Number(row.longitude), Number(row.latitude)] },
+          properties: { id: String(row.id), name: String(row.name), status: String(row.status) },
+        })),
+      };
+      map.on("load", () => {
+        if (!map) return;
+        map.addSource("receivers", { type: "geojson", data: featureCollection, cluster: true, clusterMaxZoom: 8, clusterRadius: 46 });
+        map.addLayer({ id: "receiver-clusters", type: "circle", source: "receivers", filter: ["has", "point_count"], paint: { "circle-color": "#173b2d", "circle-stroke-color": "#67e6a0", "circle-stroke-width": 2, "circle-radius": ["step", ["get", "point_count"], 18, 10, 24, 50, 32] } });
+        map.addLayer({ id: "receiver-cluster-count", type: "symbol", source: "receivers", filter: ["has", "point_count"], layout: { "text-field": ["get", "point_count_abbreviated"], "text-size": 12 }, paint: { "text-color": "#dceae5" } });
+        map.addLayer({ id: "receiver-points", type: "circle", source: "receivers", filter: ["!", ["has", "point_count"]], paint: { "circle-color": ["match", ["get", "status"], "ONLINE", "#67e6a0", "OFFLINE", "#ef6f65", "#d5a94a"], "circle-radius": 8, "circle-stroke-color": "#07100e", "circle-stroke-width": 3 } });
+        map.on("click", "receiver-clusters", event => {
+          const feature = map?.queryRenderedFeatures(event.point, { layers: ["receiver-clusters"] })[0];
+          const clusterId = Number(feature?.properties?.cluster_id);
+          const source = map?.getSource("receivers") as import("maplibre-gl").GeoJSONSource | undefined;
+          if (!feature || !source || !Number.isFinite(clusterId)) return;
+          void source.getClusterExpansionZoom(clusterId).then(zoom => {
+            const coordinates = (feature.geometry as unknown as { coordinates: [number, number] }).coordinates;
+            map?.easeTo({ center: coordinates, zoom });
+          });
+        });
+        map.on("click", "receiver-points", event => {
+          const id = event.features?.[0]?.properties?.id;
+          if (id) location.assign(`/receivers/${String(id)}`);
+        });
+      });
     });
     return () => { disposed = true; map?.remove(); };
   }, [rows]);
@@ -167,11 +214,12 @@ function ReceiverMap({ rows }: { rows: Row[] }) {
 export function ReceiversView({ id }: { id?: string }) {
   const list = useApi<Row[]>(["receivers"], "/receivers?limit=500");
   const detail = useApi<Row>(["receiver", id], id ? `/receivers/${encodeURIComponent(id)}` : "/capabilities");
+  const history = useApi<Row[]>(["receiver-status", id], id ? `/receivers/${encodeURIComponent(id)}/status-history?limit=100` : "/receivers?limit=1");
   const rows = list.data?.data ?? [];
   const selected = id ? detail.data?.data : undefined;
   return (
     <DataState loading={list.isLoading || (Boolean(id) && detail.isLoading)} error={list.error || (id ? detail.error : null)} empty={rows.length === 0}>
-      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver</a></> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
+      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred. Nearby receivers are clustered.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver</a><h3>Status history</h3>{(history.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.status)}</b><br/><span>{String(row.created_at)} · {String(row.latency_ms ?? "—")} ms</span></p>)}</> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
     </DataState>
   );
 }

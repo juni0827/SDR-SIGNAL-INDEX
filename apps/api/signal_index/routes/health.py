@@ -1,6 +1,7 @@
 import shutil
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends
 from redis import Redis
 from sqlalchemy import text
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..schemas import Envelope
+from ..secrets_store import resolved_secret
 from ..storage import ObjectStorage
 
 router = APIRouter(tags=["system"])
@@ -53,10 +55,34 @@ def health(
         }
     except Exception as exc:
         checks["worker"] = {"status": "error", "detail": type(exc).__name__}
-    checks["local_llm"] = {
-        "status": "disabled" if not settings.LOCAL_LLM_ENABLED else "configured",
-        "model": settings.LOCAL_LLM_MODEL or None,
-    }
+    if settings.LOCAL_LLM_ENABLED:
+        try:
+            api_key = resolved_secret(
+                db,
+                settings,
+                "local_llm.api_key",
+                settings.LOCAL_LLM_API_KEY.get_secret_value(),
+            )
+            response = httpx.get(
+                f"{settings.LOCAL_LLM_BASE_URL.rstrip('/')}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}"
+                },
+                timeout=1.0,
+            )
+            response.raise_for_status()
+            checks["local_llm"] = {
+                "status": "ok",
+                "model": settings.LOCAL_LLM_MODEL or None,
+            }
+        except Exception as exc:
+            checks["local_llm"] = {
+                "status": "error",
+                "model": settings.LOCAL_LLM_MODEL or None,
+                "detail": type(exc).__name__,
+            }
+    else:
+        checks["local_llm"] = {"status": "disabled", "model": None}
     critical_ok = checks["database"]["status"] == "ok"
     return Envelope(data={"status": "ok" if critical_ok else "degraded", "checks": checks})
 
@@ -67,7 +93,7 @@ def capabilities(settings: Settings = Depends(get_settings)) -> Envelope[dict[st
         data={
             "app": "Signal Index",
             "version": "0.1.0",
-            "schema_version": "0002",
+            "schema_version": "0003",
             "llm_optional": True,
             "local_llm_enabled": settings.LOCAL_LLM_ENABLED,
             "implemented": {
@@ -82,24 +108,31 @@ def capabilities(settings: Settings = Depends(get_settings)) -> Envelope[dict[st
                 "embeddings": ["audio", "transcript_text", "session_composite"],
                 "exports": [
                     "json_api",
-                    "jsonl_metadata_script",
+                    "json",
+                    "jsonl",
+                    "csv",
+                    "markdown",
                     "zip_evidence_bundle",
                     "signed_wav",
                     "signed_spectrogram_png",
-                    "graph_json_api",
+                    "graph_json_png_svg",
+                    "hypothesis_markdown_report",
                 ],
+                "graph": ["filtered_neighborhood", "layout_persistence", "json_png_svg_export"],
+                "timeline": ["multilayer", "period_overlay", "delta_calculation"],
+                "pwa": ["offline_shell", "offline_inbox", "offline_annotations", "conflict_status"],
+                "authentication": ["password", "webauthn_passkey"],
+                "object_storage": ["private_signed_urls", "multipart_transfer"],
+                "realtime": ["redis_sse", "polling_fallback"],
                 "capture": "explicit_receiver_template_only",
             },
             "not_implemented": [
-                "webauthn",
                 "speaker_identity",
                 "generic_transmitter_location_inference",
-                "multipart_s3_upload",
                 "spectrogram_tiles",
-                "graph_png_svg_export",
-                "graph_layout_persistence",
-                "all_requested_export_formats",
-                "full_change_point_analytics",
+                "production_scale_benchmark_evidence",
+                "full_device_matrix_evidence",
+                "fresh_host_twenty_step_release_gate",
             ],
             "causality_policy": "temporal association is never promoted to a causal claim automatically",
         }

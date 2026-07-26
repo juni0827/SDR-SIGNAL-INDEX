@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import ipaddress
 import secrets
@@ -7,6 +8,7 @@ from urllib.parse import urlparse
 
 import jwt
 from argon2 import PasswordHasher
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import HTTPException, Request, status
 
 from .config import Settings
@@ -60,6 +62,25 @@ def hash_ip(ip: str | None, secret: str) -> str | None:
     if not ip:
         return None
     return hashlib.sha256(f"{secret}:{ip}".encode()).hexdigest()
+
+
+def encrypt_secret(value: str, key_material: str) -> str:
+    key = hashlib.sha256(key_material.encode("utf-8")).digest()
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(nonce, value.encode("utf-8"), b"signal-index-secret-v1")
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+
+
+def decrypt_secret(value: str, key_material: str) -> str:
+    try:
+        payload = base64.urlsafe_b64decode(value.encode("ascii"))
+        nonce, ciphertext = payload[:12], payload[12:]
+        key = hashlib.sha256(key_material.encode("utf-8")).digest()
+        return AESGCM(key).decrypt(
+            nonce, ciphertext, b"signal-index-secret-v1"
+        ).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("encrypted secret could not be decrypted") from exc
 
 
 def validate_external_url(url: str, allowed_hosts: set[str] | None = None) -> str:
