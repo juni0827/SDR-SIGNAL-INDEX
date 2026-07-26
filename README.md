@@ -81,7 +81,16 @@ upload
 
 Every failure records stage, error code, stderr, attempt count, and traceback. The original object is never changed.
 
-## 4. Implementation phases
+## 4. Current implementation status
+
+This repository is a functional, persistence-backed implementation under active completion; it is not represented as satisfying every item in the original fifty-part specification. The source of truth is:
+
+- [Requirement traceability](docs/TRACEABILITY.md)
+- [Phase completion gates](docs/PHASE_GATES.md)
+
+In particular, a route, model, button, or provider interface is not counted as a completed feature. The release remains partial until the real PostgreSQL/Redis/MinIO/Celery/FFmpeg/faster-whisper stack passes the documented twenty-step end-to-end gate.
+
+## 5. Implementation phases
 
 - Phase 1: monorepo, Compose, login/session security, PostgreSQL, MinIO, CRUD, PWA shell.
 - Phase 2: upload, Celery, FFmpeg, artifacts, VAD, audio review.
@@ -139,11 +148,14 @@ make typecheck
 make test
 make test-integration
 make e2e
+make e2e-stack E2E_EXTERNAL_SERVER=1
 make backup
 make restore BACKUP=/absolute/path/to/signal-index-backup.tar.gz
 ```
 
 Audio dependencies are intentionally an install extra because PyTorch, Silero, and faster-whisper are large. `make install` includes them. The worker container also includes them.
+
+`make e2e` runs deterministic browser/UI contracts with intercepted API responses. It is not the release gate. `make e2e-stack E2E_EXTERNAL_SERVER=1` runs the non-skipped, real API/worker/storage scenario and fails if that stack is unavailable.
 
 ## Local LLM and browser agents
 
@@ -165,7 +177,7 @@ The API key remains server-side. A browser agent gets predictable routes, semant
 - All processed audio: 16 kHz mono PCM with loudness normalization.
 - CPU defaults to faster-whisper `int8`; CUDA uses `float16` when `auto`.
 - faster-whisper currently has no native Apple Metal backend, so Apple Silicon uses the supported CPU path. The original and candidates remain identical in data semantics.
-- The baseline embedding is a deterministic PyTorch-compatible 384-dimensional mel-statistics provider interface. A learned model can replace it without changing stored provenance fields.
+- The baseline audio embedding executes PyTorch STFT/statistical projection and the text embedding executes deterministic PyTorch signed feature hashing; both are 384-dimensional. They provide acoustic/text similarity, never speaker identity, and are replaceable through provider interfaces without changing stored provenance fields.
 
 ## Security and data handling
 
@@ -198,5 +210,7 @@ The restore script verifies checksums before replacing the target database and o
 - [Tool API](docs/API.md)
 - [Security model](docs/SECURITY.md)
 - [Operations](docs/OPERATIONS.md)
+- [Requirement traceability](docs/TRACEABILITY.md)
+- [Phase gates](docs/PHASE_GATES.md)
 
 License: Apache-2.0. Imported public data remains subject to its recorded source license and terms.

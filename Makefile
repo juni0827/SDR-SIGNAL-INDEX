@@ -3,7 +3,7 @@ PYTHON ?= python3
 COMPOSE ?= docker compose
 PYTHONPATH := apps/api:packages/source_adapters:packages/signal_processing:workers/audio_processor
 
-.PHONY: install infra migrate seed dev test test-integration lint typecheck e2e backup restore
+.PHONY: install infra migrate seed dev test test-integration lint typecheck e2e e2e-stack backup restore
 
 install:
 	npm install
@@ -41,10 +41,13 @@ typecheck:
 e2e:
 	npm run e2e
 
+e2e-stack:
+	@test "$(E2E_EXTERNAL_SERVER)" = "1" || (echo "Start the full Compose stack and run: make e2e-stack E2E_EXTERNAL_SERVER=1"; exit 2)
+	E2E_EXTERNAL_SERVER=1 npm run e2e:stack
+
 backup:
 	bash scripts/backup/backup.sh
 
 restore:
 	@test -n "$(BACKUP)" || (echo "Use: make restore BACKUP=/absolute/backup.tar.gz"; exit 2)
 	bash scripts/restore/restore.sh "$(BACKUP)"
-

@@ -34,7 +34,7 @@ DIGITS = {**ENGLISH_DIGITS, **RUSSIAN_DIGITS}
 SEPARATOR = re.compile(r"\s*(?:,|;|/|\b(?:break|group|группа)\b)\s*", re.IGNORECASE)
 
 
-def normalize_number_groups(text: str) -> list[str]:
+def normalize_number_groups(text: str, *, deduplicate_adjacent: bool = True) -> list[str]:
     groups: list[str] = []
     for part in SEPARATOR.split(text.casefold()):
         tokens = re.findall(r"[a-zа-яё]+|\d+", part, re.IGNORECASE)
@@ -60,6 +60,8 @@ def normalize_number_groups(text: str) -> list[str]:
                 saw_explicit = False
         if current and (saw_spoken or len(current) >= 2):
             groups.append(current)
+    if not deduplicate_adjacent:
+        return groups
     deduplicated: list[str] = []
     for group in groups:
         if not deduplicated or deduplicated[-1] != group:

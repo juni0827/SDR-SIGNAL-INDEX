@@ -18,6 +18,7 @@ dependencies = [
   "pgvector>=0.4.1,<0.5",
   "redis>=6.2,<7",
   "celery>=5.5,<6",
+  "croniter>=6,<7",
   "boto3>=1.39,<2",
   "python-multipart>=0.0.20,<0.1",
   "argon2-cffi>=25.1,<26",

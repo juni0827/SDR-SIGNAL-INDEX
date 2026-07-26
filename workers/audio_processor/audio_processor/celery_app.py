@@ -21,5 +21,16 @@ celery.conf.update(
     task_routes={
         "audio_processor.tasks.process_recording": {"queue": "audio"},
         "audio_processor.tasks.capture_receiver": {"queue": "capture"},
+        "audio_processor.source_tasks.fetch_source": {"queue": "sources"},
+    },
+    beat_schedule={
+        "dispatch-due-captures": {
+            "task": "audio_processor.tasks.dispatch_due_captures",
+            "schedule": 30.0,
+        },
+        "dispatch-due-sources": {
+            "task": "audio_processor.source_tasks.dispatch_due_sources",
+            "schedule": 60.0,
+        },
     },
 )

@@ -1,6 +1,5 @@
-import { SignalIndexApp } from "./signal-index-app";
+import { redirect } from "next/navigation";
 
 export default function Home() {
-  return <SignalIndexApp initialPath="/dashboard" />;
+  redirect("/dashboard");
 }
-

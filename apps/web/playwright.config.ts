@@ -6,6 +6,9 @@ export default defineConfig({
   retries: 0,
   use: {
     baseURL: process.env.E2E_BASE_URL ?? "http://localhost:3000",
+    launchOptions: {
+      executablePath: process.env.E2E_EXECUTABLE_PATH,
+    },
     trace: "retain-on-failure",
     video: "retain-on-failure",
   },

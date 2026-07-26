@@ -178,6 +178,8 @@ class ProcessingJob(RecordMixin, Base):
     recording_id: Mapped[str] = mapped_column(ForeignKey("recordings.id"), index=True)
     status: Mapped[str] = mapped_column(String(30), index=True)
     stage: Mapped[str] = mapped_column(String(80))
+    job_type: Mapped[str] = mapped_column(String(40), default="INITIAL")
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(100))
@@ -370,6 +372,10 @@ class CaptureJob(RecordMixin, Base):
     retention_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="SCHEDULED", index=True)
     lock_key: Mapped[str | None] = mapped_column(String(200), unique=True)
+    recording_id: Mapped[str | None] = mapped_column(ForeignKey("recordings.id"), index=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -413,3 +419,10 @@ Index("ix_relation_subject", Relation.subject_type, Relation.subject_id)
 Index("ix_relation_object", Relation.object_type, Relation.object_id)
 Index("ix_session_frequency_time", TransmissionSession.primary_frequency_hz, TransmissionSession.start_at_utc)
 Index("ix_segment_recording_start", AudioSegment.recording_id, AudioSegment.start_sec)
+Index(
+    "uq_provenance_source_record_hash",
+    Provenance.source_id,
+    Provenance.record_type,
+    Provenance.raw_hash,
+    unique=True,
+)

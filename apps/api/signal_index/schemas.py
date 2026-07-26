@@ -29,15 +29,24 @@ class SearchRequest(BaseModel):
     started_after: datetime | None = None
     started_before: datetime | None = None
     receiver_id: str | None = None
+    mode: str | None = Field(default=None, max_length=20)
+    source: str | None = Field(default=None, max_length=120)
+    tags: list[str] = Field(default_factory=list, max_length=30)
     signal_class: str | None = None
     language: str | None = None
     confidence_min: float | None = Field(default=None, ge=0, le=1)
+    transcript_confidence_max: float | None = Field(default=None, ge=0, le=1)
+    duration_min_sec: float | None = Field(default=None, ge=0)
+    duration_max_sec: float | None = Field(default=None, ge=0)
+    snr_min_db: float | None = None
+    snr_max_db: float | None = None
     reviewed: bool | None = None
     status: str | None = None
     category: str | None = None
     callsign: str | None = Field(default=None, max_length=100)
     number_group: str | None = Field(default=None, pattern=r"^[0-9 -]{1,80}$")
     exact_number: bool = True
+    number_match: Literal["exact", "normalized", "fuzzy"] | None = None
     limit: int = Field(default=50, ge=1, le=200)
     cursor: str | None = None
 
@@ -51,6 +60,18 @@ class SearchRequest(BaseModel):
             raise ValueError("frequency_min_hz must be <= frequency_max_hz")
         if self.started_after and self.started_before and self.started_after > self.started_before:
             raise ValueError("started_after must be <= started_before")
+        if (
+            self.duration_min_sec is not None
+            and self.duration_max_sec is not None
+            and self.duration_min_sec > self.duration_max_sec
+        ):
+            raise ValueError("duration_min_sec must be <= duration_max_sec")
+        if (
+            self.snr_min_db is not None
+            and self.snr_max_db is not None
+            and self.snr_min_db > self.snr_max_db
+        ):
+            raise ValueError("snr_min_db must be <= snr_max_db")
         return self
 
 
@@ -66,6 +87,33 @@ class SegmentSplit(BaseModel):
 
 class SegmentMerge(BaseModel):
     segment_ids: list[str] = Field(min_length=2, max_length=20)
+
+
+class SegmentReview(BaseModel):
+    reviewed: bool = True
+
+
+class SegmentClassification(BaseModel):
+    segment_type: Literal[
+        "VOICE",
+        "TONE",
+        "MULTIPLE_TONE",
+        "DIGITAL",
+        "MUSIC",
+        "NOISE",
+        "CARRIER",
+        "UNKNOWN",
+    ]
+    reason: str | None = Field(default=None, max_length=2_000)
+
+
+class VADRerun(BaseModel):
+    threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    minimum_speech_ms: int = Field(default=250, ge=50, le=10_000)
+    minimum_silence_ms: int = Field(default=400, ge=50, le=10_000)
+    padding_ms: int = Field(default=180, ge=0, le=5_000)
+    maximum_segment_sec: float = Field(default=45.0, ge=1.0, le=3_600)
+    merge_shorter_than_ms: int = Field(default=350, ge=0, le=10_000)
 
 
 class RelationCreate(BaseModel):

@@ -55,3 +55,7 @@ def test_query_validation() -> None:
         SearchRequest(frequency_min_hz=10, frequency_max_hz=1)
     with pytest.raises(ValidationError):
         SearchRequest(number_group="281 DROP TABLE")
+    with pytest.raises(ValidationError):
+        SearchRequest(duration_min_sec=30, duration_max_sec=10)
+    with pytest.raises(ValidationError):
+        SearchRequest(snr_min_db=15, snr_max_db=5)

@@ -77,12 +77,22 @@ class StaticSourceAdapter(JSONAdapter):
 class RemoteAdapter:
     parser_version = "1.0.0"
 
-    def __init__(self, url: str, record_type: str, allowed_hosts: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        record_type: str,
+        allowed_hosts: set[str] | None = None,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> None:
         self.fetcher = PoliteFetcher(url, allowed_hosts=allowed_hosts)
         self.record_type = record_type
+        self.etag = etag
+        self.last_modified = last_modified
 
     async def fetch(self, cursor: str | None) -> FetchResult:
-        return await self.fetcher.fetch(cursor)
+        return await self.fetcher.fetch(cursor, self.etag, self.last_modified)
 
     def deduplicate_key(self, record: NormalizedRecord) -> str:
         return stable_dedup_key(record)
@@ -121,8 +131,17 @@ class HTMLTableAdapter(RemoteAdapter):
         record_type: str,
         table_selector: str = "table",
         allowed_hosts: set[str] | None = None,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
     ) -> None:
-        super().__init__(url, record_type, allowed_hosts)
+        super().__init__(
+            url,
+            record_type,
+            allowed_hosts,
+            etag=etag,
+            last_modified=last_modified,
+        )
         self.table_selector = table_selector
 
     def parse(self, payload: bytes) -> list[NormalizedRecord]:

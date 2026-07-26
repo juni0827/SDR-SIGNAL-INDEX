@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
+from signal_processing.scheduling import next_schedule
 from source_adapters.adapters import CSVAdapter, JSONAdapter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,19 +14,19 @@ from sqlalchemy.orm import Session
 from ..config import Settings, get_settings
 from ..database import get_db
 from ..dependencies import CurrentUser
+from ..ingestion import materialize_record
 from ..models import (
     CaptureJob,
-    ExternalEvent,
     FrequencyEntry,
     Hypothesis,
     InboxItem,
-    Provenance,
     Receiver,
     SavedQuery,
     SettingRevision,
     Source,
 )
 from ..schemas import Envelope
+from ..security import validate_external_url
 from ..serialization import model_dict
 from ..storage import ObjectStorage
 
@@ -66,6 +67,29 @@ class SavedQueryCreate(BaseModel):
 class SettingCreate(BaseModel):
     key: str = Field(min_length=1, max_length=120)
     value: dict[str, Any]
+
+
+class SourceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    adapter_type: Literal[
+        "rss_atom",
+        "generic_html_table",
+        "user_defined_static",
+        "manual_frequency_list",
+        "manual_receiver_list",
+    ]
+    base_url: str | None = Field(default=None, max_length=2_048)
+    enabled: bool = False
+    parser_version: str = Field(default="1.0.0", max_length=80)
+    license_notes: str | None = Field(default=None, max_length=10_000)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourcePatch(BaseModel):
+    enabled: bool | None = None
+    parser_version: str | None = Field(default=None, max_length=80)
+    license_notes: str | None = Field(default=None, max_length=10_000)
+    config: dict[str, Any] | None = None
 
 
 def list_model(db: Session, model: type[Any], limit: int) -> list[dict[str, Any]]:
@@ -113,12 +137,92 @@ def sources(
     return Envelope(data=list_model(db, Source, limit), pagination={"limit": limit})
 
 
+@router.post("/sources", response_model=Envelope[dict[str, Any]], status_code=201)
+def create_source(
+    payload: SourceCreate,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    if db.scalar(select(Source).where(Source.name == payload.name)):
+        raise HTTPException(status_code=409, detail="source name already exists")
+    remote = payload.adapter_type in {"rss_atom", "generic_html_table"}
+    if remote and not payload.base_url:
+        raise HTTPException(status_code=422, detail="remote adapter requires base_url")
+    if payload.enabled and not remote:
+        raise HTTPException(status_code=422, detail="only fetchable remote adapters can be enabled")
+    if payload.base_url:
+        allowed_hosts = {
+            str(host).lower().rstrip(".")
+            for host in payload.config.get("allowed_hosts", [])
+            if isinstance(host, str)
+        }
+        if not allowed_hosts:
+            from urllib.parse import urlparse
+
+            host = urlparse(payload.base_url).hostname
+            if host:
+                allowed_hosts.add(host.lower().rstrip("."))
+        try:
+            validate_external_url(payload.base_url, allowed_hosts)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        config = {**payload.config, "allowed_hosts": sorted(allowed_hosts)}
+    else:
+        config = payload.config
+    source = Source(**payload.model_dump(exclude={"config"}), config=config)
+    db.add(source)
+    db.commit()
+    return Envelope(
+        data=model_dict(source),
+        warnings=[] if source.enabled else ["source is manually disabled"],
+    )
+
+
 @router.get("/sources/{source_id}", response_model=Envelope[dict[str, Any]])
 def source(source_id: str, _user: CurrentUser, db: Session = Depends(get_db)) -> Envelope[dict[str, Any]]:
     item = db.get(Source, source_id)
     if item is None or item.deleted_at is not None:
         raise HTTPException(status_code=404, detail="source not found")
     return Envelope(data=model_dict(item))
+
+
+@router.patch("/sources/{source_id}", response_model=Envelope[dict[str, Any]])
+def patch_source(
+    source_id: str,
+    payload: SourcePatch,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(Source, source_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="source not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("enabled") and item.adapter_type not in {"rss_atom", "generic_html_table"}:
+        raise HTTPException(status_code=422, detail="source adapter is not remotely fetchable")
+    for key, value in changes.items():
+        setattr(item, key, value)
+    db.commit()
+    return Envelope(data=model_dict(item))
+
+
+@router.post("/sources/{source_id}/fetch", response_model=Envelope[dict[str, Any]], status_code=202)
+def fetch_source_now(
+    source_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(Source, source_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="source not found")
+    if not item.enabled:
+        raise HTTPException(status_code=409, detail="source is manually disabled")
+    try:
+        from audio_processor.source_tasks import fetch_source
+
+        result = fetch_source.delay(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="source worker queue is unavailable") from exc
+    return Envelope(data={"source_id": source_id, "task_id": result.id, "status": "QUEUED"})
 
 
 @router.post("/sources/import", response_model=Envelope[dict[str, Any]], status_code=201)
@@ -154,70 +258,27 @@ def import_source(
         raw_key = f"source-archive/{source.id}/{raw_hash}.bin"
         ObjectStorage(settings).upload(raw_key, payload, file.content_type or "application/octet-stream")
     created: list[str] = []
+    duplicate_count = 0
     for record in records:
-        data = record.data
-        if record_type == "FREQUENCY":
-            item: Any = FrequencyEntry(
-                frequency_hz=int(data["frequency_hz"]),
-                lower_frequency_hz=int(data["lower_frequency_hz"]) if data.get("lower_frequency_hz") else None,
-                upper_frequency_hz=int(data["upper_frequency_hz"]) if data.get("upper_frequency_hz") else None,
-                mode=str(data.get("mode") or "") or None,
-                label=str(data.get("label") or data["frequency_hz"]),
-                category=str(data.get("category") or "UNKNOWN").upper(),
-                country_code=str(data.get("country_code") or "") or None,
-                station_name=str(data.get("station_name") or "") or None,
-                callsigns=[value.strip() for value in str(data.get("callsigns") or "").split(",") if value.strip()],
-                schedule={},
-                source_id=source.id,
-                confidence=float(data.get("confidence") or record.confidence),
-                notes=str(data.get("notes") or "") or None,
-            )
-        elif record_type == "RECEIVER":
-            item = Receiver(
-                name=str(data["name"]),
-                receiver_type=str(data.get("receiver_type") or "OTHER").upper(),
-                base_url=str(data["base_url"]),
-                country_code=str(data.get("country_code") or "") or None,
-                latitude=float(data["latitude"]) if data.get("latitude") else None,
-                longitude=float(data["longitude"]) if data.get("longitude") else None,
-                supported_modes=[
-                    value.strip() for value in str(data.get("supported_modes") or "").split(",") if value.strip()
-                ],
-                status=str(data.get("status") or "UNKNOWN").upper(),
-                metadata_json={"imported": True},
-            )
-        else:
-            item = ExternalEvent(
-                title=str(data["title"]),
-                event_type=str(data.get("event_type") or "IMPORTED"),
-                country_codes=[
-                    value.strip() for value in str(data.get("country_codes") or "").split(",") if value.strip()
-                ],
-                location={"text": data.get("location")},
-                description=str(data.get("description") or "") or None,
-                source_url=str(data.get("source_url") or "") or None,
-                source_name=source_name,
-                confidence=float(data.get("confidence") or record.confidence),
-            )
-        db.add(item)
-        db.flush()
-        created.append(item.id)
-        db.add(
-            Provenance(
-                record_type=record_type,
-                record_id=item.id,
-                source_id=source.id,
-                source_url=record.source_url,
-                parser_version=adapter.parser_version,
-                raw_hash=adapter.deduplicate_key(record),
-                confidence=record.confidence,
-                license_notes=license_notes,
-                raw_object_key=raw_key,
-            )
+        record_id, was_created = materialize_record(
+            db,
+            source=source,
+            record=record,
+            fetched_at=None,
+            raw_object_key=raw_key,
         )
+        if was_created:
+            created.append(record_id)
+        else:
+            duplicate_count += 1
     db.commit()
     return Envelope(
-        data={"source": model_dict(source), "created_record_ids": created, "count": len(created)},
+        data={
+            "source": model_dict(source),
+            "created_record_ids": created,
+            "count": len(created),
+            "duplicate_count": duplicate_count,
+        },
         provenance=[{"raw_hash": raw_hash, "raw_object_key": raw_key}],
     )
 
@@ -229,6 +290,18 @@ def hypotheses(
     db: Session = Depends(get_db),
 ) -> Envelope[list[dict[str, Any]]]:
     return Envelope(data=list_model(db, Hypothesis, limit), pagination={"limit": limit})
+
+
+@router.get("/hypotheses/{hypothesis_id}", response_model=Envelope[dict[str, Any]])
+def hypothesis(
+    hypothesis_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(Hypothesis, hypothesis_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="hypothesis not found")
+    return Envelope(data=model_dict(item))
 
 
 @router.post("/inbox", response_model=Envelope[dict[str, Any]], status_code=201)
@@ -254,6 +327,18 @@ def inbox_list(
 
 @router.post("/capture", response_model=Envelope[dict[str, Any]], status_code=201)
 def capture(payload: CaptureCreate, _user: CurrentUser, db: Session = Depends(get_db)) -> Envelope[dict[str, Any]]:
+    receiver = db.get(Receiver, payload.receiver_id)
+    if receiver is None or receiver.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="receiver not found")
+    if payload.enabled and not receiver.metadata_json.get("capture_url_template"):
+        raise HTTPException(
+            status_code=422,
+            detail="enabled capture requires receiver.metadata.capture_url_template",
+        )
+    try:
+        next_run_at = next_schedule(payload.schedule_utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     lock_key = (
         f"capture:{payload.receiver_id}:{payload.frequency_hz}:{payload.schedule_utc}:"
         f"{payload.capture_duration_sec}"
@@ -261,7 +346,12 @@ def capture(payload: CaptureCreate, _user: CurrentUser, db: Session = Depends(ge
     existing = db.scalar(select(CaptureJob).where(CaptureJob.lock_key == lock_key))
     if existing:
         raise HTTPException(status_code=409, detail="duplicate capture schedule")
-    item = CaptureJob(**payload.model_dump(), status="SCHEDULED", lock_key=lock_key)
+    item = CaptureJob(
+        **payload.model_dump(),
+        status="SCHEDULED",
+        lock_key=lock_key,
+        next_run_at=next_run_at,
+    )
     db.add(item)
     db.commit()
     return Envelope(

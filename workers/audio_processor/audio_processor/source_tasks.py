@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from celery import Task
 from signal_index.database import SessionLocal
-from signal_index.models import Provenance, Source, SourceFetchJob
+from signal_index.ingestion import materialize_record
+from signal_index.models import Source, SourceFetchJob
 from signal_index.storage import ObjectStorage
 from source_adapters.adapters import HTMLTableAdapter, RSSAtomAdapter
 from source_adapters.base import SourceAdapter
+from sqlalchemy import select
 
 from .celery_app import celery
 
@@ -28,12 +30,18 @@ def fetch_source(self: Task, source_id: str) -> dict[str, int | str]:
         url = source.base_url
         adapter_type = source.adapter_type
         cursor = source.cursor
+        etag = source.etag
+        last_modified = source.last_modified
     if not url:
         raise RuntimeError("remote source requires base_url")
     allowed_hosts = set(config.get("allowed_hosts", []))
     if adapter_type == "rss_atom":
         adapter: SourceAdapter = RSSAtomAdapter(
-            url, str(config.get("record_type", "EVENT")), allowed_hosts
+            url,
+            str(config.get("record_type", "EVENT")),
+            allowed_hosts,
+            etag=etag,
+            last_modified=last_modified,
         )
     elif adapter_type == "generic_html_table":
         adapter = HTMLTableAdapter(
@@ -41,6 +49,8 @@ def fetch_source(self: Task, source_id: str) -> dict[str, int | str]:
             str(config.get("record_type", "FREQUENCY")),
             str(config.get("table_selector", "table")),
             allowed_hosts,
+            etag=etag,
+            last_modified=last_modified,
         )
     else:
         raise RuntimeError(f"scheduled remote adapter is not supported: {adapter_type}")
@@ -64,25 +74,32 @@ def fetch_source(self: Task, source_id: str) -> dict[str, int | str]:
             source.last_modified = result.last_modified
             source.last_fetched_at = result.fetched_at
             stored_job.status = "COMPLETED"
-            stored_job.records_parsed = len(records)
             stored_job.raw_response_object_key = raw_key
+            materialized = 0
             for record in records:
-                db.add(
-                    Provenance(
+                enriched_record = record
+                if record.source_url is None and result.source_url is not None:
+                    from source_adapters.base import NormalizedRecord
+
+                    enriched_record = NormalizedRecord(
                         record_type=record.record_type,
-                        record_id=adapter.deduplicate_key(record),
-                        source_id=source_id,
-                        source_url=record.source_url or result.source_url,
-                        fetched_at=result.fetched_at,
-                        first_observed_at=record.observed_at,
-                        parser_version=source.parser_version,
-                        raw_hash=adapter.deduplicate_key(record),
+                        data=record.data,
+                        source_url=result.source_url,
+                        observed_at=record.observed_at,
                         confidence=record.confidence,
-                        license_notes=record.license_notes or source.license_notes,
-                        raw_object_key=raw_key,
+                        license_notes=record.license_notes,
+                        raw=record.raw,
                     )
+                _, created = materialize_record(
+                    db,
+                    source=source,
+                    record=enriched_record,
+                    fetched_at=result.fetched_at,
+                    raw_object_key=raw_key,
                 )
-        return {"source_id": source_id, "records": len(records)}
+                materialized += int(created)
+            stored_job.records_parsed = materialized
+        return {"source_id": source_id, "records": materialized}
     except Exception as exc:
         terminal = self.request.retries >= self.max_retries
         with SessionLocal.begin() as db:
@@ -97,3 +114,35 @@ def fetch_source(self: Task, source_id: str) -> dict[str, int | str]:
         raise self.retry(
             exc=exc, countdown=min(3600, 2 ** self.request.retries * 30)
         ) from exc
+
+
+@celery.task(name="audio_processor.source_tasks.dispatch_due_sources")
+def dispatch_due_sources() -> dict[str, int]:
+    now = datetime.now(UTC)
+    dispatched = 0
+    with SessionLocal.begin() as db:
+        sources = list(
+            db.scalars(
+                select(Source).where(
+                    Source.enabled.is_(True),
+                    Source.deleted_at.is_(None),
+                    Source.adapter_type.in_(["rss_atom", "generic_html_table"]),
+                )
+            )
+        )
+        for source in sources:
+            interval_sec = max(300, int(source.config.get("interval_sec", 3_600)))
+            due_at = (source.last_fetched_at or source.created_at) + timedelta(
+                seconds=interval_sec
+            )
+            active = db.scalar(
+                select(SourceFetchJob).where(
+                    SourceFetchJob.source_id == source.id,
+                    SourceFetchJob.status.in_(["FETCHING", "RETRYING"]),
+                    SourceFetchJob.deleted_at.is_(None),
+                )
+            )
+            if due_at <= now and active is None:
+                fetch_source.delay(source.id)
+                dispatched += 1
+    return {"dispatched": dispatched}

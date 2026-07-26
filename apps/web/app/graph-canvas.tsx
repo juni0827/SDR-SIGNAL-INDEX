@@ -3,41 +3,67 @@
 import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node } from "@xyflow/react";
 import { useQuery } from "@tanstack/react-query";
 import "@xyflow/react/dist/style.css";
+
 import { api, type Envelope } from "@/lib/api";
+import { DataState } from "@/components/data-state";
 
-const fallbackNodes: Node[] = [
-  {id: "session", position: {x: 280, y: 180}, data: {label: "Session S-81A2"}, style: {background: "#132521", color: "#ddf7e8", border: "1px solid #62e6a0"}},
-  {id: "freq", position: {x: 40, y: 40}, data: {label: "4.625 MHz"}},
-  {id: "receiver", position: {x: 40, y: 300}, data: {label: "Receiver NL-01"}},
-  {id: "call", position: {x: 540, y: 40}, data: {label: "KILO 72"}},
-  {id: "number", position: {x: 540, y: 300}, data: {label: "281 · 46 · 992"}},
-  {id: "event", position: {x: 780, y: 180}, data: {label: "External event"}},
-];
-const fallbackEdges: Edge[] = [
-  {id: "e1", source: "session", target: "freq", label: "OBSERVED_ON"},
-  {id: "e2", source: "session", target: "receiver", label: "RECEIVED_BY"},
-  {id: "e3", source: "session", target: "call", label: "USES_CALLSIGN"},
-  {id: "e4", source: "session", target: "number", label: "CONTAINS_NUMBER_GROUP"},
-  {id: "e5", source: "session", target: "event", label: "+4h 18m · COMPUTED", animated: true},
-];
+type GraphPayload = {
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<Record<string, unknown>>;
+};
 
-export function GraphCanvas() {
-  const query = useQuery({
-    queryKey: ["relation-graph"],
-    queryFn: () => api<Envelope<{nodes:Array<Record<string,unknown>>;edges:Array<Record<string,unknown>>}>>("/graph?limit=500"),
+export function GraphCanvas({
+  minimumConfidence,
+  predicate,
+  onData,
+  onEdge,
+}: {
+  minimumConfidence: number;
+  predicate: string;
+  onData(value: GraphPayload): void;
+  onEdge(value: Record<string, unknown>): void;
+}) {
+  const params = new URLSearchParams({
+    limit: "500",
+    minimum_confidence: String(minimumConfidence),
   });
-  const nodes: Node[] = (query.data?.data.nodes ?? []).map((item,index) => ({
+  if (predicate) params.set("predicate", predicate);
+  const query = useQuery({
+    queryKey: ["relation-graph", minimumConfidence, predicate],
+    queryFn: async () => {
+      const result = await api<Envelope<GraphPayload>>(`/graph?${params}`);
+      onData(result.data);
+      return result;
+    },
+  });
+  const rawEdges = query.data?.data.edges ?? [];
+  const nodes: Node[] = (query.data?.data.nodes ?? []).map((item, index) => ({
     id: String(item.id),
-    position: {x: (index % 5) * 210, y: Math.floor(index / 5) * 140},
-    data: {label: String(item.label)},
-    type: "default",
+    position: { x: (index % 5) * 230, y: Math.floor(index / 5) * 150 },
+    data: { label: String(item.label) },
   }));
-  const edges: Edge[] = (query.data?.data.edges ?? []).map(item => ({
+  const edges: Edge[] = rawEdges.map(item => ({
     id: String(item.id),
     source: String(item.source),
     target: String(item.target),
     label: `${String(item.predicate)} · ${Math.round(Number(item.confidence) * 100)}%`,
     animated: String(item.relation_status) === "COMPUTED",
   }));
-  return <ReactFlow nodes={nodes.length?nodes:fallbackNodes} edges={edges.length?edges:fallbackEdges} fitView><Background color="#20342f"/><Controls/><MiniMap/></ReactFlow>;
+  return (
+    <DataState loading={query.isLoading} error={query.error} empty={nodes.length === 0}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        fitView
+        onEdgeClick={(_event, edge) => {
+          const raw = rawEdges.find(item => String(item.id) === edge.id);
+          if (raw) onEdge(raw);
+        }}
+      >
+        <Background color="#20342f"/>
+        <Controls/>
+        <MiniMap/>
+      </ReactFlow>
+    </DataState>
+  );
 }

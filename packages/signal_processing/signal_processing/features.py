@@ -58,8 +58,20 @@ class RuleBasedClassifier:
             return "NOISE", 0.72
         if value.spectral_flatness < 0.04 and value.bandwidth_hz < 300:
             return "TONE", 0.78
+        if (
+            value.spectral_flatness < 0.16
+            and 300 <= value.bandwidth_hz <= 1_800
+            and value.zero_crossing_rate > 0.12
+        ):
+            return "MULTIPLE_TONE", 0.66
         if value.zero_crossing_rate > 0.23 and value.spectral_flatness > 0.2:
             return "DIGITAL", 0.61
+        if (
+            value.spectral_flatness < 0.24
+            and value.bandwidth_hz > 1_200
+            and 0.03 < value.zero_crossing_rate < 0.2
+        ):
+            return "MUSIC", 0.58
         if 0.015 < value.zero_crossing_rate < 0.2 and value.spectral_centroid < 2_800:
             return "VOICE", 0.68
         return "UNKNOWN", 0.35

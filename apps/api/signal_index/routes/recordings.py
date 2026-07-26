@@ -6,7 +6,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -14,8 +14,8 @@ from ..config import Settings, get_settings
 from ..database import get_db
 from ..dependencies import CurrentUser
 from ..malware import scanner
-from ..models import ProcessingJob, Provenance, Recording
-from ..schemas import Envelope
+from ..models import ProcessingJob, Provenance, Recording, Revision
+from ..schemas import Envelope, VADRerun
 from ..serialization import model_dict
 from ..storage import ObjectStorage
 
@@ -28,6 +28,31 @@ ALLOWED_AUDIO_SIGNATURES = (
     b"OggS",
     b"ID3",
 )
+
+
+@router.get("", response_model=Envelope[list[dict[str, object]]])
+def list_recordings(
+    _user: CurrentUser,
+    limit: int = Query(default=100, ge=1, le=500),
+    before: datetime | None = None,
+    db: Session = Depends(get_db),
+) -> Envelope[list[dict[str, object]]]:
+    statement = select(Recording).where(Recording.deleted_at.is_(None))
+    if before:
+        statement = statement.where(Recording.started_at_utc < before)
+    rows = list(
+        db.scalars(statement.order_by(Recording.started_at_utc.desc(), Recording.id).limit(limit + 1))
+    )
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return Envelope(
+        data=[model_dict(row) for row in rows],
+        pagination={
+            "limit": limit,
+            "has_more": has_more,
+            "next_before": rows[-1].started_at_utc.isoformat() if has_more and rows else None,
+        },
+    )
 
 
 def validate_audio_signature(header: bytes) -> None:
@@ -153,3 +178,60 @@ def recording_media(
             else None,
         }
     )
+
+
+@router.post("/{recording_id}/reprocess", response_model=Envelope[dict[str, object]], status_code=202)
+def reprocess_recording(
+    recording_id: str,
+    payload: VADRerun,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, object]]:
+    recording = db.get(Recording, recording_id)
+    if recording is None or recording.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="recording not found")
+    active = db.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.recording_id == recording_id,
+            ProcessingJob.status.in_(["PENDING", "PROCESSING", "RETRYING"]),
+            ProcessingJob.deleted_at.is_(None),
+        )
+    )
+    if active:
+        raise HTTPException(status_code=409, detail="recording already has an active processing job")
+    job = ProcessingJob(
+        recording_id=recording.id,
+        status="PENDING",
+        stage="INGEST",
+        job_type="VAD_RERUN",
+        parameters={
+            **payload.model_dump(),
+            "replace_active_derivatives": True,
+        },
+    )
+    db.add(job)
+    db.add(
+        Revision(
+            record_type="RECORDING",
+            record_id=recording.id,
+            actor_type="USER",
+            actor_id=user.id,
+            before={"processing_status": recording.processing_status},
+            after={"processing_status": "PENDING", "vad": payload.model_dump()},
+            reason="VAD reprocessing requested",
+        )
+    )
+    recording.processing_status = "PENDING"
+    db.commit()
+    try:
+        from audio_processor.tasks import process_recording
+
+        process_recording.delay(recording.id, job.id)
+    except Exception as exc:
+        job.status = "FAILED"
+        job.error_code = "QUEUE_UNAVAILABLE"
+        job.error_stderr = str(exc)
+        recording.processing_status = "FAILED"
+        db.commit()
+        raise HTTPException(status_code=503, detail="processing queue is unavailable") from exc
+    return Envelope(data={"recording": model_dict(recording), "job": model_dict(job)})

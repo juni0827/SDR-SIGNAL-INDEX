@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 
-from .numbers import ENGLISH_DIGITS, normalize_number_groups
+from .numbers import DIGITS, normalize_number_groups
 
 NATO = {
     "alpha": "A",
@@ -33,6 +34,29 @@ NATO = {
     "yankee": "Y",
     "zulu": "Z",
 }
+RUSSIAN_PHONETIC = {
+    "анна": "А",
+    "борис": "Б",
+    "василий": "В",
+    "григорий": "Г",
+    "дмитрий": "Д",
+    "елена": "Е",
+    "иван": "И",
+    "константин": "К",
+    "леонид": "Л",
+    "михаил": "М",
+    "николай": "Н",
+    "ольга": "О",
+    "павел": "П",
+    "роман": "Р",
+    "сергей": "С",
+    "татьяна": "Т",
+    "фёдор": "Ф",
+    "харитон": "Х",
+    "юрий": "Ю",
+    "яков": "Я",
+}
+PHONETIC = {**NATO, **RUSSIAN_PHONETIC}
 
 
 @dataclass(frozen=True)
@@ -46,19 +70,40 @@ class EntityCandidate:
 
 def extract_entities(text: str) -> list[EntityCandidate]:
     candidates: list[EntityCandidate] = []
-    for group in normalize_number_groups(text):
+    all_groups = normalize_number_groups(text, deduplicate_adjacent=False)
+    for group in dict.fromkeys(all_groups):
         candidates.append(EntityCandidate("NUMBER_GROUP", group, group, 0.88))
+    for group, count in Counter(all_groups).items():
+        if count > 1:
+            candidates.append(
+                EntityCandidate(
+                    "REPEATED_PHRASE",
+                    group,
+                    group,
+                    min(0.95, 0.65 + count * 0.08),
+                )
+            )
+    lengths = [len(group) for group in all_groups]
+    if len(lengths) >= 3 and len(set(lengths)) == 1:
+        candidates.append(
+            EntityCandidate(
+                "CUSTOM",
+                " ".join(all_groups),
+                f"CONSTANT_NUMBER_GROUP_LENGTH:{lengths[0]}",
+                0.82,
+            )
+        )
     lower = text.casefold()
-    words = re.findall(r"[a-z]+(?:-[a-z]+)?", lower)
+    words = re.findall(r"[a-zа-яё]+(?:-[a-zа-яё]+)?", lower)
     for index in range(len(words)):
         run: list[str] = []
         cursor = index
-        while cursor < len(words) and (words[cursor] in NATO or words[cursor] in ENGLISH_DIGITS):
+        while cursor < len(words) and (words[cursor] in PHONETIC or words[cursor] in DIGITS):
             run.append(words[cursor])
             cursor += 1
-        if len(run) >= 2 and any(token in NATO for token in run):
+        if len(run) >= 2 and any(token in PHONETIC for token in run):
             normalized = "".join(
-                NATO[token] if token in NATO else ENGLISH_DIGITS[token] for token in run
+                PHONETIC[token] if token in PHONETIC else DIGITS[token] for token in run
             )
             raw = " ".join(run)
             candidates.append(EntityCandidate("PHONETIC_TOKEN", raw, normalized, 0.9))

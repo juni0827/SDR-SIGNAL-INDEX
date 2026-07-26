@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,8 +33,24 @@ class Settings(BaseSettings):
     ASR_DEVICE: str = "auto"
     ASR_COMPUTE_TYPE: str = "auto"
     ASR_BEAM_SIZE: int = Field(default=5, ge=1, le=20)
+    ASR_ALTERNATIVE_CANDIDATES: int = Field(default=1, ge=0, le=3)
+    ASR_USE_VAD: bool = False
     SILERO_VAD_ENABLED: bool = True
     VAD_THRESHOLD: float = Field(default=0.55, ge=0.0, le=1.0)
+    VAD_MINIMUM_SPEECH_MS: int = Field(default=250, ge=50, le=10_000)
+    VAD_MINIMUM_SILENCE_MS: int = Field(default=400, ge=50, le=10_000)
+    VAD_PADDING_MS: int = Field(default=180, ge=0, le=5_000)
+    VAD_MAXIMUM_SEGMENT_SEC: float = Field(default=45.0, ge=1.0, le=3_600)
+    VAD_MERGE_SHORTER_THAN_MS: int = Field(default=350, ge=0, le=10_000)
+    SESSION_MERGE_THRESHOLD: float = Field(default=0.68, ge=0.0, le=1.0)
+    SESSION_WINDOW_SEC: int = Field(default=1_800, ge=1, le=86_400)
+    SESSION_FREQUENCY_WINDOW_HZ: int = Field(default=20_000, ge=0, le=10_000_000)
+    SESSION_WEIGHT_TIME: float = Field(default=0.25, ge=0.0, le=1.0)
+    SESSION_WEIGHT_FREQUENCY: float = Field(default=0.20, ge=0.0, le=1.0)
+    SESSION_WEIGHT_ACOUSTIC: float = Field(default=0.20, ge=0.0, le=1.0)
+    SESSION_WEIGHT_CALLSIGN: float = Field(default=0.15, ge=0.0, le=1.0)
+    SESSION_WEIGHT_NUMBERS: float = Field(default=0.12, ge=0.0, le=1.0)
+    SESSION_WEIGHT_MESSAGE: float = Field(default=0.08, ge=0.0, le=1.0)
     LOCAL_LLM_ENABLED: bool = False
     LOCAL_LLM_BASE_URL: str = "http://host.docker.internal:1234/v1"
     LOCAL_LLM_MODEL: str = ""
@@ -60,6 +76,22 @@ class Settings(BaseSettings):
         if "@" not in normalized or normalized.startswith("@") or normalized.endswith("@"):
             raise ValueError("FIRST_USER_EMAIL must be an email-like address")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_session_weights(self) -> "Settings":
+        total = sum(
+            (
+                self.SESSION_WEIGHT_TIME,
+                self.SESSION_WEIGHT_FREQUENCY,
+                self.SESSION_WEIGHT_ACOUSTIC,
+                self.SESSION_WEIGHT_CALLSIGN,
+                self.SESSION_WEIGHT_NUMBERS,
+                self.SESSION_WEIGHT_MESSAGE,
+            )
+        )
+        if total <= 0:
+            raise ValueError("at least one session grouping weight must be positive")
+        return self
 
     @property
     def cors_origins(self) -> list[str]:

@@ -39,7 +39,9 @@ from ..schemas import (
     HypothesisPatch,
     RelationCreate,
     SearchRequest,
+    SegmentClassification,
     SegmentMerge,
+    SegmentReview,
     SegmentSplit,
     TranscriptCorrection,
 )
@@ -52,6 +54,7 @@ from ..services import (
     search_segments,
     search_sessions,
 )
+from ..storage import ObjectStorage
 
 router = APIRouter(tags=["local LLM tools"])
 
@@ -189,6 +192,105 @@ def segment_detail(segment_id: str, _user: CurrentUser, db: Session = Depends(ge
     return Envelope(data=data, provenance=record_provenance(db, "SEGMENT", segment.id))
 
 
+@router.get("/segments/{segment_id}/media", response_model=Envelope[dict[str, str | None]])
+def segment_media(
+    segment_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, str | None]]:
+    segment = db.get(AudioSegment, segment_id)
+    if segment is None or segment.deleted_at is not None:
+        raise missing("segment")
+    storage = ObjectStorage(settings)
+    return Envelope(
+        data={
+            "processed_url": (
+                storage.signed_get_url(segment.processed_object_key)
+                if segment.processed_object_key
+                else None
+            ),
+            "waveform_url": (
+                storage.signed_get_url(segment.waveform_object_key)
+                if segment.waveform_object_key
+                else None
+            ),
+            "spectrogram_url": (
+                storage.signed_get_url(segment.spectrogram_object_key)
+                if segment.spectrogram_object_key
+                else None
+            ),
+        }
+    )
+
+
+@router.patch("/segments/{segment_id}/review", response_model=Envelope[dict[str, Any]])
+def review_segment(
+    segment_id: str,
+    payload: SegmentReview,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    segment = db.get(AudioSegment, segment_id)
+    if segment is None or segment.deleted_at is not None:
+        raise missing("segment")
+    before = {"reviewed": segment.reviewed}
+    segment.reviewed = payload.reviewed
+    db.add(
+        Revision(
+            record_type="SEGMENT",
+            record_id=segment.id,
+            actor_type="USER",
+            actor_id=user.id,
+            before=before,
+            after={"reviewed": segment.reviewed},
+            reason="manual review state",
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(segment))
+
+
+@router.patch("/segments/{segment_id}/classification", response_model=Envelope[dict[str, Any]])
+def classify_segment(
+    segment_id: str,
+    payload: SegmentClassification,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    segment = db.get(AudioSegment, segment_id)
+    if segment is None or segment.deleted_at is not None:
+        raise missing("segment")
+    before = {
+        "segment_type": segment.segment_type,
+        "class_confidence": segment.class_confidence,
+    }
+    segment.segment_type = payload.segment_type
+    segment.class_confidence = 1.0
+    segment.manually_adjusted = True
+    segment.class_features = {
+        **segment.class_features,
+        "manual_override": True,
+        "manual_reason": payload.reason,
+    }
+    db.add(
+        Revision(
+            record_type="SEGMENT",
+            record_id=segment.id,
+            actor_type="USER",
+            actor_id=user.id,
+            before=before,
+            after={
+                "segment_type": segment.segment_type,
+                "class_confidence": segment.class_confidence,
+            },
+            reason=payload.reason or "manual signal classification",
+        )
+    )
+    db.commit()
+    return Envelope(data=model_dict(segment))
+
+
 @router.post("/segments/{segment_id}/transcripts", response_model=Envelope[dict[str, Any]])
 def correct_transcript(
     segment_id: str,
@@ -240,6 +342,53 @@ def correct_transcript(
     )
 
 
+def replace_session_segment_ids(
+    db: Session,
+    *,
+    removed_ids: list[str],
+    replacement_ids: list[str],
+    user_id: str,
+    reason: str,
+) -> None:
+    sessions = list(
+        db.scalars(
+            select(TransmissionSession).where(
+                TransmissionSession.deleted_at.is_(None),
+                or_(
+                    *[
+                        TransmissionSession.segment_ids.contains([segment_id])
+                        for segment_id in removed_ids
+                    ]
+                ),
+            )
+        )
+    )
+    removed = set(removed_ids)
+    for session in sessions:
+        before = list(session.segment_ids)
+        updated: list[str] = []
+        inserted = False
+        for segment_id in before:
+            if segment_id in removed:
+                if not inserted:
+                    updated.extend(replacement_ids)
+                    inserted = True
+            else:
+                updated.append(segment_id)
+        session.segment_ids = list(dict.fromkeys(updated))
+        db.add(
+            Revision(
+                record_type="SESSION",
+                record_id=session.id,
+                actor_type="USER",
+                actor_id=user_id,
+                before={"segment_ids": before},
+                after={"segment_ids": session.segment_ids},
+                reason=reason,
+            )
+        )
+
+
 @router.post("/segments/{segment_id}/split", response_model=Envelope[list[dict[str, Any]]])
 def split_segment(
     segment_id: str,
@@ -280,6 +429,52 @@ def split_segment(
     segment.deleted_at = datetime.now(UTC)
     db.add_all([left, right])
     db.flush()
+    source_transcripts = list(
+        db.scalars(
+            select(Transcript).where(
+                Transcript.segment_id == segment.id,
+                Transcript.deleted_at.is_(None),
+            )
+        )
+    )
+    for child in (left, right):
+        for source_transcript in source_transcripts:
+            db.add(
+                Transcript(
+                    segment_id=child.id,
+                    transcript_type="ALTERNATIVE",
+                    language=source_transcript.language,
+                    text=source_transcript.text,
+                    normalized_text=source_transcript.normalized_text,
+                    model_name=source_transcript.model_name,
+                    model_version=f"{source_transcript.model_version or 'manual'}:boundary-copy",
+                    confidence=min(0.5, source_transcript.confidence or 0.5),
+                    word_timestamps=[],
+                    is_preferred=False,
+                    parent_transcript_id=source_transcript.id,
+                )
+            )
+        db.add(
+            Relation(
+                subject_type="SEGMENT",
+                subject_id=child.id,
+                predicate="DERIVED_FROM",
+                object_type="SEGMENT",
+                object_id=segment.id,
+                confidence=1.0,
+                relation_status="USER_ASSERTED",
+                causal_claim=False,
+                evidence_ids=[segment.id],
+                created_by=user.id,
+            )
+        )
+    replace_session_segment_ids(
+        db,
+        removed_ids=[segment.id],
+        replacement_ids=[left.id, right.id],
+        user_id=user.id,
+        reason="manual segment split propagated to session",
+    )
     db.add(
         Revision(
             record_type="SEGMENT",
@@ -335,8 +530,59 @@ def merge_segments(
     )
     db.add(merged)
     db.flush()
+    preferred_parts: list[Transcript] = []
+    for source_segment in segments:
+        preferred = db.scalar(
+            select(Transcript).where(
+                Transcript.segment_id == source_segment.id,
+                Transcript.is_preferred.is_(True),
+                Transcript.deleted_at.is_(None),
+            )
+        )
+        if preferred:
+            preferred_parts.append(preferred)
+    if preferred_parts:
+        db.add(
+            Transcript(
+                segment_id=merged.id,
+                transcript_type="ALTERNATIVE",
+                language=preferred_parts[0].language,
+                text=" ".join(part.text for part in preferred_parts),
+                normalized_text=" ".join(
+                    part.normalized_text or part.text.casefold().strip()
+                    for part in preferred_parts
+                ),
+                model_name="manual-boundary-merge",
+                model_version="1.0.0",
+                confidence=min(part.confidence or 0.5 for part in preferred_parts),
+                word_timestamps=[],
+                is_preferred=False,
+                parent_transcript_id=preferred_parts[0].id,
+            )
+        )
     for segment in segments:
         segment.deleted_at = datetime.now(UTC)
+        db.add(
+            Relation(
+                subject_type="SEGMENT",
+                subject_id=merged.id,
+                predicate="DERIVED_FROM",
+                object_type="SEGMENT",
+                object_id=segment.id,
+                confidence=1.0,
+                relation_status="USER_ASSERTED",
+                causal_claim=False,
+                evidence_ids=[segment.id],
+                created_by=user.id,
+            )
+        )
+    replace_session_segment_ids(
+        db,
+        removed_ids=[segment.id for segment in segments],
+        replacement_ids=[merged.id],
+        user_id=user.id,
+        reason="manual segment merge propagated to session",
+    )
     db.add(
         Revision(
             record_type="SEGMENT",
@@ -351,7 +597,10 @@ def merge_segments(
     db.commit()
     return Envelope(
         data=model_dict(merged),
-        warnings=["Source segments were soft-deleted and remain in revision history."],
+        warnings=[
+            "Source segments and transcripts remain preserved; merged transcript is an unpreferred alternative pending review.",
+            "Derived media artifacts must be regenerated for the merged boundary.",
+        ],
     )
 
 
@@ -747,10 +996,73 @@ def timeline_data(
             .limit(500)
         )
     )
+    session_ids = [row.id for row in sessions]
+    segment_ids = [segment_id for row in sessions for segment_id in row.segment_ids]
+    entities = list(
+        db.scalars(
+            select(ExtractedEntity).where(
+                or_(
+                    ExtractedEntity.session_id.in_(session_ids),
+                    ExtractedEntity.segment_id.in_(segment_ids),
+                ),
+                ExtractedEntity.entity_type.in_(["CALLSIGN", "NUMBER_GROUP"]),
+                ExtractedEntity.deleted_at.is_(None),
+            )
+        )
+    )
+    annotations = list(
+        db.scalars(
+            select(Annotation).where(
+                or_(
+                    and_(
+                        Annotation.target_type == "SESSION",
+                        Annotation.target_id.in_(session_ids),
+                    ),
+                    and_(
+                        Annotation.target_type == "SEGMENT",
+                        Annotation.target_id.in_(segment_ids),
+                    ),
+                ),
+                Annotation.deleted_at.is_(None),
+            )
+        )
+    )
+    hypotheses = [
+        value
+        for value in db.scalars(
+            select(Hypothesis).where(Hypothesis.deleted_at.is_(None)).limit(500)
+        )
+        if set(value.related_session_ids) & set(session_ids)
+    ]
     return Envelope(
         data={
             "sessions": [model_dict(row) for row in sessions],
+            "frequency_activity": [
+                {
+                    "session_id": row.id,
+                    "frequency_hz": row.primary_frequency_hz,
+                    "start_at_utc": row.start_at_utc,
+                    "end_at_utc": row.end_at_utc,
+                }
+                for row in sessions
+            ],
+            "callsigns": [
+                model_dict(row) for row in entities if row.entity_type == "CALLSIGN"
+            ],
+            "number_groups": [
+                model_dict(row) for row in entities if row.entity_type == "NUMBER_GROUP"
+            ],
+            "receiver_observations": [
+                {
+                    "session_id": row.id,
+                    "receiver_ids": row.receiver_ids,
+                    "observed_at_utc": row.start_at_utc,
+                }
+                for row in sessions
+            ],
             "external_events": [model_dict(row) for row in events],
+            "annotations": [model_dict(row) for row in annotations],
+            "hypotheses": [model_dict(row) for row in hypotheses],
             "resolution": "seconds",
             "display_timezone": "UTC",
         },
@@ -764,6 +1076,12 @@ def graph_data(
     _user: CurrentUser,
     minimum_confidence: float = Query(default=0.0, ge=0, le=1),
     relation_status: str | None = None,
+    predicate: str | None = None,
+    node_types: str | None = None,
+    focus_id: str | None = None,
+    depth: int = Query(default=1, ge=1, le=3),
+    start_at_utc: datetime | None = None,
+    end_at_utc: datetime | None = None,
     limit: int = Query(default=500, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> Envelope[dict[str, Any]]:
@@ -773,6 +1091,41 @@ def graph_data(
     ]
     if relation_status:
         filters.append(Relation.relation_status == relation_status)
+    if predicate:
+        filters.append(Relation.predicate == predicate)
+    if start_at_utc:
+        filters.append(Relation.created_at >= start_at_utc)
+    if end_at_utc:
+        filters.append(Relation.created_at <= end_at_utc)
+    requested_types = {
+        value.strip().upper() for value in (node_types or "").split(",") if value.strip()
+    }
+    if requested_types:
+        filters.append(
+            or_(
+                Relation.subject_type.in_(requested_types),
+                Relation.object_type.in_(requested_types),
+            )
+        )
+    if focus_id:
+        neighborhood = {focus_id}
+        collected_ids: set[str] = set()
+        for _ in range(depth):
+            adjacent = list(
+                db.scalars(
+                    select(Relation).where(
+                        Relation.deleted_at.is_(None),
+                        or_(
+                            Relation.subject_id.in_(neighborhood),
+                            Relation.object_id.in_(neighborhood),
+                        ),
+                    )
+                )
+            )
+            collected_ids.update(value.id for value in adjacent)
+            neighborhood.update(value.subject_id for value in adjacent)
+            neighborhood.update(value.object_id for value in adjacent)
+        filters.append(Relation.id.in_(collected_ids or {"__none__"}))
     relations = list(
         db.scalars(
             select(Relation).where(*filters).order_by(Relation.confidence.desc()).limit(limit)
@@ -810,6 +1163,12 @@ def graph_data(
         query={
             "minimum_confidence": minimum_confidence,
             "relation_status": relation_status,
+            "predicate": predicate,
+            "node_types": sorted(requested_types),
+            "focus_id": focus_id,
+            "depth": depth,
+            "start_at_utc": start_at_utc,
+            "end_at_utc": end_at_utc,
             "limit": limit,
         },
         pagination={"limit": limit, "truncated": len(relations) == limit},
@@ -842,10 +1201,46 @@ def analytics_summary(
             )
         )
     )
+    active_duration_sec = float(
+        db.scalar(
+            select(func.coalesce(func.sum(AudioSegment.duration_sec), 0.0)).where(
+                AudioSegment.deleted_at.is_(None)
+            )
+        )
+        or 0.0
+    )
+    receiver_coverage = int(
+        db.scalar(
+            select(func.count(func.distinct(Recording.receiver_id))).where(
+                Recording.receiver_id.is_not(None),
+                Recording.deleted_at.is_(None),
+            )
+        )
+        or 0
+    )
+    top_entities: dict[str, list[dict[str, Any]]] = {}
+    for entity_type, key in (("CALLSIGN", "top_callsigns"), ("NUMBER_GROUP", "top_number_groups")):
+        rows = db.execute(
+            select(
+                ExtractedEntity.normalized_value,
+                func.count(ExtractedEntity.id).label("count"),
+            )
+            .where(
+                ExtractedEntity.entity_type == entity_type,
+                ExtractedEntity.deleted_at.is_(None),
+            )
+            .group_by(ExtractedEntity.normalized_value)
+            .order_by(func.count(ExtractedEntity.id).desc())
+            .limit(5)
+        ).all()
+        top_entities[key] = [{"value": value, "count": count} for value, count in rows]
     return Envelope(
         data={
             "session_count": session_count,
             "segment_count": segment_count,
+            "active_duration_sec": active_duration_sec,
+            "receiver_coverage": receiver_coverage,
+            **top_entities,
             "mean_session_confidence": (
                 sum(confidence_rows) / len(confidence_rows) if confidence_rows else None
             ),
