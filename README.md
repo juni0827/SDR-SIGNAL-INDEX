@@ -136,6 +136,28 @@ Open:
 
 The first account is created from `FIRST_USER_EMAIL` and `FIRST_USER_PASSWORD`. Public registration is disabled.
 
+## Open the full stack directly from GitHub
+
+[Open this repository in GitHub Codespaces](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=juni0827%2FSDR-SIGNAL-INDEX)
+
+Codespaces creates the Docker development environment, starts PostgreSQL, Redis,
+MinIO, API, web, worker, and scheduler, then opens the private forwarded PWA port
+(`3000`). It seeds the synthetic dataset only when the database is empty, so the
+Spectrum explorer has data immediately. Browser API traffic is same-origin through
+the Next.js `/api/v1` proxy, therefore the forwarded PWA address works without
+editing `NEXT_PUBLIC_API_URL` or exposing an API key.
+
+This is a full development stack rather than GitHub Pages: the browser URL is a
+private forwarded `app.github.dev` address, while the application itself listens
+on port 3000 inside the Codespace. Codespaces usage consumes the account's included
+quota and may be billable after that quota; it is not an unconditional free host.
+
+For a fresh seeded view after intentionally removing data, run from the Codespace:
+
+```bash
+docker compose exec api python scripts/seed/seed.py
+```
+
 ## Run autonomous collection while you are offline
 
 The web page is a control surface; it is not the collector. Docker Compose runs

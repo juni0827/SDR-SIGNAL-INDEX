@@ -1,0 +1,23 @@
+{
+  "name": "SDR Signal Index",
+  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.codespaces.yml"],
+  "service": "workspace",
+  "workspaceFolder": "/workspaces/signal-index",
+  "shutdownAction": "stopCompose",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+  },
+  "forwardPorts": [3000, 8000, 9001],
+  "portsAttributes": {
+    "3000": { "label": "Signal Index PWA", "onAutoForward": "openBrowser", "visibility": "private" },
+    "8000": { "label": "Signal Index API", "onAutoForward": "silent", "visibility": "private" },
+    "9001": { "label": "MinIO console", "onAutoForward": "silent", "visibility": "private" }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/start-stack.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-python.mypy-type-checker", "dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
+    }
+  }
+}

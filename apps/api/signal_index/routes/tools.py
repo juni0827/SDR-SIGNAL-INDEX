@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import zipfile
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,6 +25,7 @@ from ..models import (
     Embedding,
     ExternalEvent,
     ExtractedEntity,
+    FrequencyEntry,
     Hypothesis,
     HypothesisHistory,
     InboxItem,
@@ -1584,6 +1586,173 @@ def analytics_summary(
             "generated_for_window_ending_utc": datetime.now(UTC),
             "causal_claims_inferred": False,
         }
+    )
+
+
+@router.get("/spectrum", response_model=Envelope[dict[str, Any]])
+def indexed_activity_spectrum(
+    _user: CurrentUser,
+    start_at_utc: datetime,
+    end_at_utc: datetime,
+    frequency_min_hz: int = Query(ge=0),
+    frequency_max_hz: int = Query(ge=1),
+    time_bins: int = Query(default=96, ge=12, le=288),
+    frequency_bins: int = Query(default=96, ge=12, le=256),
+    receiver_id: str | None = None,
+    mode: str | None = Query(default=None, max_length=20),
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    """Return an indexed session-density waterfall, never simulated RF power.
+
+    Raw IQ/FFT samples are not a property of a TransmissionSession. This endpoint
+    deliberately bins persisted observations so the UI can distinguish an activity
+    waterfall from a receiver's live RF waterfall.
+    """
+    if start_at_utc >= end_at_utc:
+        raise HTTPException(status_code=422, detail="spectrum start must be before end")
+    if frequency_min_hz >= frequency_max_hz:
+        raise HTTPException(status_code=422, detail="spectrum minimum frequency must be below maximum frequency")
+
+    filters: list[Any] = [
+        TransmissionSession.end_at_utc >= start_at_utc,
+        TransmissionSession.start_at_utc <= end_at_utc,
+        TransmissionSession.primary_frequency_hz >= frequency_min_hz,
+        TransmissionSession.primary_frequency_hz <= frequency_max_hz,
+        TransmissionSession.deleted_at.is_(None),
+    ]
+    if receiver_id:
+        filters.append(TransmissionSession.receiver_ids.cast(String).ilike(f"%{receiver_id}%"))
+    if mode:
+        matching_recording_ids = list(
+            db.scalars(
+                select(Recording.id)
+                .where(Recording.mode == mode.upper(), Recording.deleted_at.is_(None))
+                .limit(5_000)
+            )
+        )
+        filters.append(
+            or_(
+                *[
+                    TransmissionSession.recording_ids.cast(String).ilike(f"%{recording_id}%")
+                    for recording_id in matching_recording_ids
+                ]
+            )
+            if matching_recording_ids
+            else TransmissionSession.id == "__none__"
+        )
+
+    sessions = list(
+        db.scalars(
+            select(TransmissionSession)
+            .where(*filters)
+            .order_by(TransmissionSession.start_at_utc)
+            .limit(50_000)
+        )
+    )
+    window_seconds = (end_at_utc - start_at_utc).total_seconds()
+    time_bin_sec = max(1, math.ceil(window_seconds / time_bins))
+    frequency_bin_hz = max(1, math.ceil((frequency_max_hz - frequency_min_hz) / frequency_bins))
+    cells: dict[tuple[int, int], dict[str, float | int]] = {}
+
+    for session in sessions:
+        clipped_start = max(session.start_at_utc, start_at_utc)
+        clipped_end = min(session.end_at_utc, end_at_utc)
+        first_time_bin = max(0, int((clipped_start - start_at_utc).total_seconds() // time_bin_sec))
+        last_time_bin = min(time_bins - 1, int((clipped_end - start_at_utc).total_seconds() // time_bin_sec))
+        frequency_bin = min(
+            frequency_bins - 1,
+            max(0, int((session.primary_frequency_hz - frequency_min_hz) // frequency_bin_hz)),
+        )
+        active_duration = max(0.0, (clipped_end - clipped_start).total_seconds())
+        occupied_bins = max(1, last_time_bin - first_time_bin + 1)
+        for time_bin in range(first_time_bin, last_time_bin + 1):
+            cell = cells.setdefault(
+                (time_bin, frequency_bin),
+                {"session_count": 0, "active_duration_sec": 0.0, "confidence_total": 0.0},
+            )
+            cell["session_count"] = int(cell["session_count"]) + 1
+            cell["active_duration_sec"] = float(cell["active_duration_sec"]) + active_duration / occupied_bins
+            cell["confidence_total"] = float(cell["confidence_total"]) + session.confidence
+
+    markers = list(
+        db.scalars(
+            select(FrequencyEntry)
+            .where(
+                FrequencyEntry.frequency_hz.between(frequency_min_hz, frequency_max_hz),
+                FrequencyEntry.deleted_at.is_(None),
+            )
+            .order_by(FrequencyEntry.frequency_hz)
+            .limit(2_000)
+        )
+    )
+    return Envelope(
+        data={
+            "kind": "INDEXED_ACTIVITY_WATERFALL",
+            "raw_fft_available": False,
+            "start_at_utc": start_at_utc,
+            "end_at_utc": end_at_utc,
+            "frequency_min_hz": frequency_min_hz,
+            "frequency_max_hz": frequency_max_hz,
+            "time_bins": time_bins,
+            "frequency_bins": frequency_bins,
+            "time_bin_sec": time_bin_sec,
+            "frequency_bin_hz": frequency_bin_hz,
+            "cells": [
+                {
+                    "time_bin": time_bin,
+                    "frequency_bin": frequency_bin,
+                    "session_count": int(cell["session_count"]),
+                    "active_duration_sec": round(float(cell["active_duration_sec"]), 3),
+                    "mean_confidence": round(
+                        float(cell["confidence_total"]) / int(cell["session_count"]), 4
+                    ),
+                }
+                for (time_bin, frequency_bin), cell in sorted(cells.items())
+            ],
+            "sessions": [
+                {
+                    "id": session.id,
+                    "title": session.title,
+                    "primary_frequency_hz": session.primary_frequency_hz,
+                    "start_at_utc": session.start_at_utc,
+                    "end_at_utc": session.end_at_utc,
+                    "confidence": session.confidence,
+                    "callsigns": session.callsigns,
+                    "number_groups": session.number_groups,
+                    "receiver_ids": session.receiver_ids,
+                    "category": session.category,
+                    "status": session.status,
+                }
+                for session in sessions
+            ],
+            "markers": [
+                {
+                    "id": marker.id,
+                    "frequency_hz": marker.frequency_hz,
+                    "label": marker.label,
+                    "category": marker.category,
+                    "mode": marker.mode,
+                    "watchlisted": marker.watchlisted,
+                    "favorite": marker.favorite,
+                }
+                for marker in markers
+            ],
+        },
+        query={
+            "start_at_utc": start_at_utc,
+            "end_at_utc": end_at_utc,
+            "frequency_min_hz": frequency_min_hz,
+            "frequency_max_hz": frequency_max_hz,
+            "time_bins": time_bins,
+            "frequency_bins": frequency_bins,
+            "receiver_id": receiver_id,
+            "mode": mode,
+        },
+        pagination={"sessions_analyzed": len(sessions), "truncated": len(sessions) == 50_000},
+        warnings=[
+            "Color encodes indexed session activity, not receiver IQ/FFT power.",
+            "Receiver locations are reception locations, not inferred transmitter locations.",
+        ],
     )
 
 

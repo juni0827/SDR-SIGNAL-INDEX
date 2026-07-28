@@ -7,7 +7,10 @@ export interface Envelope<T> {
   generated_at_utc: string;
 }
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
+// Same-origin is the default so a forwarded/private Codespaces port needs no
+// browser-visible API host or CORS exception. Deployments may still opt into a
+// separate public API with NEXT_PUBLIC_API_URL.
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api/v1";
 
 export function csrfToken(): string | undefined {
   if (typeof document === "undefined") return undefined;
@@ -29,4 +32,3 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) throw new Error(`api_error:${response.status}:${(await response.text()).slice(0, 300)}`);
   return response.json() as Promise<T>;
 }
-

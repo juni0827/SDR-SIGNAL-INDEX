@@ -182,39 +182,158 @@ export function RecordingDetailView({ id }: { id: string }) {
   );
 }
 
+type SpectrumCell = { time_bin: number; frequency_bin: number; session_count: number; active_duration_sec: number; mean_confidence: number };
+type SpectrumSession = Row & { primary_frequency_hz: number; start_at_utc: string; end_at_utc: string; callsigns: string[]; number_groups: string[] };
+type SpectrumPayload = Row & {
+  time_bins: number;
+  frequency_bins: number;
+  time_bin_sec: number;
+  frequency_bin_hz: number;
+  frequency_min_hz: number;
+  frequency_max_hz: number;
+  cells: SpectrumCell[];
+  sessions: SpectrumSession[];
+  markers: Row[];
+};
+
+type SpectrumSelection = { timeBin: number; frequencyBin: number };
+
+function activityColor(value: number) {
+  if (value <= 0) return "#0b0d10";
+  const normalized = Math.min(1, Math.log1p(value) / Math.log(7));
+  const hue = 215 - normalized * 175;
+  const lightness = 18 + normalized * 53;
+  return `hsl(${hue} 82% ${lightness}%)`;
+}
+
+function SpectrumWaterfall({ data, selection, onSelect }: { data: SpectrumPayload; selection: SpectrumSelection | null; onSelect: (value: SpectrumSelection) => void }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const node = canvas.current;
+    if (!node) return;
+    const context = node.getContext("2d");
+    if (!context) return;
+    const rect = node.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.max(320, Math.floor(rect.width || 900));
+    const height = Math.max(280, Math.floor(rect.height || 480));
+    node.width = width * ratio;
+    node.height = height * ratio;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.fillStyle = "#08090b";
+    context.fillRect(0, 0, width, height);
+    const cellWidth = width / data.time_bins;
+    const cellHeight = height / data.frequency_bins;
+    const counts = new Map(data.cells.map(cell => [`${cell.time_bin}:${cell.frequency_bin}`, cell.session_count]));
+    for (let time = 0; time < data.time_bins; time += 1) {
+      for (let freq = 0; freq < data.frequency_bins; freq += 1) {
+        const drawY = height - (freq + 1) * cellHeight;
+        context.fillStyle = activityColor(counts.get(`${time}:${freq}`) ?? 0);
+        context.fillRect(time * cellWidth, drawY, Math.ceil(cellWidth), Math.ceil(cellHeight));
+      }
+    }
+    context.strokeStyle = "rgba(255,255,255,.08)";
+    context.lineWidth = 1;
+    for (let time = 0; time <= data.time_bins; time += Math.max(1, Math.floor(data.time_bins / 8))) {
+      context.beginPath(); context.moveTo(time * cellWidth, 0); context.lineTo(time * cellWidth, height); context.stroke();
+    }
+    for (const marker of data.markers) {
+      const markerBin = Math.floor((Number(marker.frequency_hz) - data.frequency_min_hz) / data.frequency_bin_hz);
+      if (markerBin < 0 || markerBin >= data.frequency_bins) continue;
+      const y = height - (markerBin + 0.5) * cellHeight;
+      context.strokeStyle = marker.watchlisted ? "#f3c969" : "rgba(190,200,209,.42)";
+      context.setLineDash([3, 4]); context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke(); context.setLineDash([]);
+    }
+    if (selection) {
+      context.strokeStyle = "#f8fafc";
+      context.lineWidth = 2;
+      context.strokeRect(selection.timeBin * cellWidth, height - (selection.frequencyBin + 1) * cellHeight, cellWidth, cellHeight);
+    }
+  }, [data, selection]);
+  return <canvas
+    ref={canvas}
+    className="spectrum-canvas"
+    data-testid="spectrum-waterfall"
+    aria-label="Indexed activity waterfall. Click a time and frequency cell to inspect indexed sessions."
+    role="img"
+    onClick={event => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const timeBin = Math.min(data.time_bins - 1, Math.max(0, Math.floor((event.clientX - rect.left) / rect.width * data.time_bins)));
+      const frequencyBin = Math.min(data.frequency_bins - 1, Math.max(0, Math.floor((rect.bottom - event.clientY) / rect.height * data.frequency_bins)));
+      onSelect({ timeBin, frequencyBin });
+    }}
+  />;
+}
+
+function toUtcInput(value: Date) {
+  return value.toISOString().slice(0, 16);
+}
+
 export function FrequenciesView({ frequency }: { frequency?: number }) {
   const client = useQueryClient();
+  const initialEnd = useMemo(() => new Date(), []);
+  const initialStart = useMemo(() => new Date(initialEnd.getTime() - 7 * 86_400_000), [initialEnd]);
+  const [start, setStart] = useState(toUtcInput(initialStart));
+  const [end, setEnd] = useState(toUtcInput(initialEnd));
+  const [range, setRange] = useState(() => ({ min: frequency ? Math.max(0, frequency - 100_000) : 2_000_000, max: frequency ? frequency + 100_000 : 30_000_000 }));
   const [mode, setMode] = useState("");
-  const activityWindow = useMemo(() => {
-    const end = new Date();
-    return {
-      start: new Date(end.getTime() - 30 * 86_400_000).toISOString(),
-      end: end.toISOString(),
-    };
-  }, []);
-  const catalog = useApi<Row[]>(["frequencies"], "/frequencies?limit=500");
-  const activity = useApi<Row>(
-    ["frequency-activity", frequency, mode],
-    frequency
-      ? `/frequencies/${frequency}/activity?tolerance_hz=0`
-      : `/analytics/activity?start_at_utc=${encodeURIComponent(activityWindow.start)}&end_at_utc=${encodeURIComponent(activityWindow.end)}${mode ? `&mode=${encodeURIComponent(mode)}` : ""}`,
-  );
+  const [receiverId, setReceiverId] = useState("");
+  const [selection, setSelection] = useState<SpectrumSelection | null>(null);
+  const spectrumPath = useMemo(() => {
+    const params = new URLSearchParams({ start_at_utc: new Date(start).toISOString(), end_at_utc: new Date(end).toISOString(), frequency_min_hz: String(range.min), frequency_max_hz: String(range.max), time_bins: "96", frequency_bins: "96" });
+    if (mode) params.set("mode", mode);
+    if (receiverId) params.set("receiver_id", receiverId);
+    return `/spectrum?${params.toString()}`;
+  }, [end, mode, range.max, range.min, receiverId, start]);
+  const spectrum = useApi<SpectrumPayload>(["spectrum", spectrumPath], spectrumPath);
+  const receivers = useApi<Row[]>(["spectrum-receivers"], "/receivers?limit=500");
   const update = useMutation({
-    mutationFn: ({ id, watchlisted, favorite }: { id: string; watchlisted: boolean; favorite: boolean }) =>
-      api(`/frequencies/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ watchlisted, favorite }),
-      }),
-    onSuccess: () => client.invalidateQueries({ queryKey: ["frequencies"] }),
+    mutationFn: ({ id, watchlisted, favorite }: { id: string; watchlisted: boolean; favorite: boolean }) => api(`/frequencies/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ watchlisted, favorite }) }),
+    onSuccess: () => { void client.invalidateQueries({ queryKey: ["spectrum"] }); },
   });
-  const rows = catalog.data?.data ?? [];
-  const frequencyCounts = (activity.data?.data.frequency_activity_count as Record<string, number> | undefined) ?? {};
-  const maxCount = Math.max(1, ...Object.values(frequencyCounts));
-  return (
-    <DataState loading={catalog.isLoading || activity.isLoading} error={catalog.error || activity.error} empty={!frequency && rows.length === 0}>
-      <div className="split"><section className="panel full"><header><h2>{frequency ? formatFrequency(frequency) : "Known frequency index"}</h2>{!frequency ? <label>Mode filter<select value={mode} onChange={event => setMode(event.target.value)}><option value="">All</option>{["AM","USB","LSB","CW"].map(value => <option key={value}>{value}</option>)}</select></label> : null}</header>{!frequency ? <div className="frequency-heatmap" aria-label="Frequency activity heatmap">{Object.entries(frequencyCounts).map(([hz, count]) => <Link href={`/frequencies/${hz}`} key={hz} title={`${formatFrequency(hz)} · ${count} sessions`} style={{ height: `${18 + count / maxCount * 100}px` }}><span>{formatFrequency(hz)}</span><b>{count}</b></Link>)}</div> : null}<div className="cards">{rows.map(row => <article key={String(row.id)}><Link href={`/frequencies/${String(row.frequency_hz)}`}><Layer kind="observed"/><h2>{formatFrequency(row.frequency_hz)}</h2><p>{String(row.label)} · {String(row.category)} · {String(row.mode || "mode unknown")}</p></Link><div className="card-actions"><button aria-label={`Watch ${String(row.label)}`} onClick={() => update.mutate({ id: String(row.id), watchlisted: !Boolean(row.watchlisted), favorite: Boolean(row.favorite) })}>{row.watchlisted ? "Watching" : "Watch"}</button><button aria-label={`Favorite ${String(row.label)}`} onClick={() => update.mutate({ id: String(row.id), watchlisted: Boolean(row.watchlisted), favorite: !Boolean(row.favorite) })}>{row.favorite ? "★ Favorite" : "☆ Favorite"}</button></div></article>)}</div></section><aside className="panel inspector"><span className="kicker">ACTIVITY</span><h2>{frequency ? formatFrequency(frequency) : "All bands"}</h2><pre>{JSON.stringify(activity.data?.data ?? {}, null, 2)}</pre></aside></div>
-    </DataState>
-  );
+  const data = spectrum.data?.data;
+  const selectedStart = data && selection ? new Date(new Date(String(data.start_at_utc)).getTime() + selection.timeBin * data.time_bin_sec * 1000) : null;
+  const selectedEnd = selectedStart && data ? new Date(selectedStart.getTime() + data.time_bin_sec * 1000) : null;
+  const selectedFrequencyMin = data && selection ? data.frequency_min_hz + selection.frequencyBin * data.frequency_bin_hz : null;
+  const selectedFrequencyMax = selectedFrequencyMin != null && data ? selectedFrequencyMin + data.frequency_bin_hz : null;
+  const selectedSessions = data && selection && selectedStart && selectedEnd && selectedFrequencyMin != null && selectedFrequencyMax != null
+    ? data.sessions.filter(session => new Date(session.end_at_utc) >= selectedStart && new Date(session.start_at_utc) <= selectedEnd && session.primary_frequency_hz >= selectedFrequencyMin && session.primary_frequency_hz < selectedFrequencyMax)
+    : [];
+  const selectedCell = data && selection ? data.cells.find(cell => cell.time_bin === selection.timeBin && cell.frequency_bin === selection.frequencyBin) : undefined;
+  const setPreset = (min: number, max: number) => { setRange({ min, max }); setSelection(null); };
+  return <DataState loading={spectrum.isLoading || receivers.isLoading} error={spectrum.error || receivers.error} empty={false}>
+    <section className="spectrum-explorer" data-testid="spectrum-explorer">
+      <div className="spectrum-main">
+        <header className="spectrum-header">
+          <div><span className="kicker">SPECTRUM EXPLORER / INDEXED OBSERVATIONS</span><h2>{frequency ? `${formatFrequency(frequency)} focus` : "Activity waterfall"}</h2><p>Time × frequency density from indexed sessions. It is not a live receiver FFT or IQ waterfall.</p></div>
+          <div className="spectrum-status"><i/> INDEXED ACTIVITY <small>{data?.raw_fft_available ? "raw FFT available" : "raw FFT unavailable"}</small></div>
+        </header>
+        <div className="spectrum-toolbar" aria-label="Spectrum filters">
+          <div className="spectrum-presets"><button onClick={() => setPreset(10_000, 500_000)}>VLF</button><button onClick={() => setPreset(2_000_000, 30_000_000)}>HF</button><button onClick={() => setPreset(3_000_000, 30_000_000)}>Shortwave</button></div>
+          <label>From UTC<input aria-label="Spectrum start UTC" type="datetime-local" value={start} onChange={event => setStart(event.target.value)}/></label>
+          <label>To UTC<input aria-label="Spectrum end UTC" type="datetime-local" value={end} onChange={event => setEnd(event.target.value)}/></label>
+          <label>Min Hz<input aria-label="Spectrum minimum frequency" type="number" min="0" value={range.min} onChange={event => setRange(current => ({ ...current, min: Number(event.target.value) }))}/></label>
+          <label>Max Hz<input aria-label="Spectrum maximum frequency" type="number" min="1" value={range.max} onChange={event => setRange(current => ({ ...current, max: Number(event.target.value) }))}/></label>
+          <select aria-label="Spectrum mode" value={mode} onChange={event => setMode(event.target.value)}><option value="">All modes</option>{["AM", "USB", "LSB", "CW"].map(value => <option value={value} key={value}>{value}</option>)}</select>
+          <select aria-label="Spectrum receiver" value={receiverId} onChange={event => setReceiverId(event.target.value)}><option value="">All receivers</option>{(receivers.data?.data ?? []).map(receiver => <option value={String(receiver.id)} key={String(receiver.id)}>{String(receiver.name)}</option>)}</select>
+        </div>
+        <div className="waterfall-shell">
+          <div className="waterfall-y-axis"><span>{formatFrequency(data?.frequency_max_hz ?? range.max)}</span><span>{formatFrequency((Number(data?.frequency_min_hz ?? range.min) + Number(data?.frequency_max_hz ?? range.max)) / 2)}</span><span>{formatFrequency(data?.frequency_min_hz ?? range.min)}</span></div>
+          <div className="waterfall-stage">{data ? <SpectrumWaterfall data={data} selection={selection} onSelect={setSelection}/> : <div className="spectrum-loading">Loading indexed activity…</div>}<div className="waterfall-markers" aria-label="Known frequency markers">{(data?.markers ?? []).filter(marker => marker.watchlisted || marker.favorite).slice(0, 12).map(marker => <span key={String(marker.id)} title={`${String(marker.label)} · ${formatFrequency(marker.frequency_hz)}`}>{String(marker.label)}</span>)}</div></div>
+          <div className="waterfall-x-axis"><span>{data ? new Date(String(data.start_at_utc)).toISOString().slice(0, 16).replace("T", " ") : "UTC"}</span><span>UTC</span><span>{data ? new Date(String(data.end_at_utc)).toISOString().slice(0, 16).replace("T", " ") : ""}</span></div>
+        </div>
+        <footer className="spectrum-legend"><span><i className="legend-idle"/> no indexed session</span><span><i className="legend-low"/> sparse</span><span><i className="legend-high"/> repeated / high density</span><span>Dashed lines = known frequency; gold = watchlist.</span></footer>
+        <section className="panel spectrum-results"><header><div><span className="kicker">SELECTION RESULTS</span><h2>{selection ? `${selectedSessions.length} overlapping session${selectedSessions.length === 1 ? "" : "s"}` : "Select a waterfall cell"}</h2></div><span>{selectedCell ? `${selectedCell.session_count} indexed observations` : "Click the grid"}</span></header>{selectedSessions.length ? <SessionTable rows={selectedSessions.slice(0, 30)}/> : <p className="empty-state">Choose a colored cell to inspect its sessions, callsigns, and number groups.</p>}</section>
+      </div>
+      <aside className="panel spectrum-inspector">
+        <span className="kicker">CELL INSPECTOR</span><h2>{selectedFrequencyMin != null ? `${formatFrequency(selectedFrequencyMin)} – ${formatFrequency(selectedFrequencyMax)}` : "No cell selected"}</h2>
+        {selectedStart && selectedEnd ? <p className="inspector-time">{selectedStart.toISOString().replace("T", " ").slice(0, 19)} → {selectedEnd.toISOString().replace("T", " ").slice(0, 19)} UTC</p> : <p className="inspector-time">Click a point in the time × frequency grid.</p>}
+        <dl><dt>Sessions</dt><dd>{selectedCell?.session_count ?? 0}</dd><dt>Active seconds</dt><dd>{Math.round(selectedCell?.active_duration_sec ?? 0)}</dd><dt>Mean confidence</dt><dd>{selectedCell ? `${Math.round(selectedCell.mean_confidence * 100)}%` : "—"}</dd><dt>Bin width</dt><dd>{data ? formatFrequency(data.frequency_bin_hz) : "—"}</dd></dl>
+        <h3>Entities in selection</h3><div className="spectrum-entities">{Array.from(new Set(selectedSessions.flatMap(session => session.callsigns ?? []))).map(value => <span key={`c-${value}`}>CALL {value}</span>)}{Array.from(new Set(selectedSessions.flatMap(session => session.number_groups ?? []))).map(value => <span key={`n-${value}`}># {value}</span>)}{!selectedSessions.length ? <small>Nothing selected yet.</small> : null}</div>
+        <h3>Known frequencies</h3><div className="spectrum-marker-list">{(data?.markers ?? []).slice(0, 18).map(marker => <article key={String(marker.id)}><Link href={`/frequencies/${String(marker.frequency_hz)}`}><b>{formatFrequency(marker.frequency_hz)}</b><small>{String(marker.label)} · {String(marker.category)}</small></Link><button aria-label={`Watch ${String(marker.label)}`} onClick={() => update.mutate({ id: String(marker.id), watchlisted: !Boolean(marker.watchlisted), favorite: Boolean(marker.favorite) })}>{marker.watchlisted ? "Watching" : "Watch"}</button></article>)}</div>
+      </aside>
+    </section>
+  </DataState>;
 }
 
 function ReceiverMap({ rows }: { rows: Row[] }) {

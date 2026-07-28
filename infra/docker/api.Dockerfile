@@ -8,6 +8,7 @@ COPY apps apps
 COPY packages packages
 COPY workers workers
 COPY infra infra
+COPY scripts scripts
 RUN pip install --no-cache-dir .
 ENV PYTHONPATH=/app/apps/api:/app/packages/source_adapters:/app/packages/signal_processing:/app/workers/audio_processor
 USER 65532:65532
