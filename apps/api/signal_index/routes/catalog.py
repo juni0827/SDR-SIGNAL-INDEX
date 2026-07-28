@@ -26,8 +26,8 @@ from ..models import (
     Hypothesis,
     HypothesisHistory,
     InboxItem,
-    Provenance,
     ProcessingJob,
+    Provenance,
     Receiver,
     ReceiverStatus,
     SavedQuery,
@@ -94,6 +94,9 @@ class SourceCreate(BaseModel):
     adapter_type: Literal[
         "rss_atom",
         "generic_html_table",
+        "websdr_directory",
+        "kiwisdr_directory",
+        "priyom_schedule",
         "user_defined_static",
         "manual_frequency_list",
         "manual_receiver_list",
@@ -103,6 +106,63 @@ class SourceCreate(BaseModel):
     parser_version: str = Field(default="1.0.0", max_length=80)
     license_notes: str | None = Field(default=None, max_length=10_000)
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+REMOTE_ADAPTER_TYPES = {
+    "rss_atom",
+    "generic_html_table",
+    "websdr_directory",
+    "kiwisdr_directory",
+    "priyom_schedule",
+}
+
+
+PUBLIC_SOURCE_PROFILES: dict[str, dict[str, Any]] = {
+    "websdr-directory": {
+        "id": "websdr-directory",
+        "name": "WebSDR directory (permission required)",
+        "adapter_type": "websdr_directory",
+        "base_url": "http://websdr.ewi.utwente.nl/~~websdrlistk?v=1&fmt=2&chseq=0",
+        "license_notes": "The official directory response states that reuse in another website or automated system requires prior permission. Do not enable this source without that permission.",
+        "config": {
+            "allowed_hosts": ["websdr.ewi.utwente.nl"],
+            "interval_sec": 86_400,
+            "archive_raw_response": True,
+            "profile_id": "websdr-directory",
+            "requires_terms_approval": True,
+        },
+        "description": "Adapter for the official WebSDR directory JSON. It is installed paused and requires the operator's documented permission before background collection.",
+    },
+    "kiwisdr-receiverbook": {
+        "id": "kiwisdr-receiverbook",
+        "name": "KiwiSDR public receiver directory (Receiverbook)",
+        "adapter_type": "kiwisdr_directory",
+        "base_url": "https://www.receiverbook.de/?page=1&type=kiwisdr",
+        "license_notes": "Receiverbook listing metadata remains subject to the source site's terms. Signal Index stores provenance and checks robots.txt before every fetch.",
+        "config": {
+            "allowed_hosts": ["www.receiverbook.de"],
+            "interval_sec": 86_400,
+            "max_pages": 31,
+            "archive_raw_response": True,
+            "profile_id": "kiwisdr-receiverbook",
+        },
+        "description": "Refreshes the bounded public KiwiSDR directory once per day. It creates browser-tunable receiver catalogue records only.",
+    },
+    "priyom-number-station-schedule": {
+        "id": "priyom-number-station-schedule",
+        "name": "Priyom number-station schedule",
+        "adapter_type": "priyom_schedule",
+        "base_url": "https://calendar2.priyom.org/events",
+        "license_notes": "Priyom schedule content is CC BY-NC-SA 4.0. Preserve source attribution and do not treat a published schedule as a confirmed observation.",
+        "config": {
+            "allowed_hosts": ["calendar2.priyom.org"],
+            "interval_sec": 21_600,
+            "archive_raw_response": True,
+            "profile_id": "priyom-number-station-schedule",
+        },
+        "description": "Refreshes Priyom's public calendar every six hours and materializes attributed NUMBERS frequency index entries.",
+    },
+}
 
 
 class SourcePatch(BaseModel):
@@ -197,6 +257,40 @@ def receivers(
     db: Session = Depends(get_db),
 ) -> Envelope[list[dict[str, Any]]]:
     return Envelope(data=list_model(db, Receiver, limit), pagination={"limit": limit})
+
+
+@router.get("/receivers/{receiver_id}/tune", response_model=Envelope[dict[str, str]])
+def receiver_tune_link(
+    receiver_id: str,
+    _user: CurrentUser,
+    frequency_hz: int = Query(ge=0, le=100_000_000_000),
+    mode: str = Query(default="USB", min_length=1, max_length=20, pattern=r"^[A-Za-z0-9_-]+$"),
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, str]]:
+    """Render a receiver's catalogue tuning URL with SSRF-safe host pinning."""
+    item = db.get(Receiver, receiver_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="receiver not found")
+    template = item.tuning_url_template
+    if not template:
+        return Envelope(
+            data={"url": item.base_url},
+            warnings=["this receiver has no verified tuning template; opened its base page instead"],
+        )
+    try:
+        rendered = template.format(
+            frequency_hz=frequency_hz,
+            frequency_khz=f"{frequency_hz / 1_000:g}",
+            mode=mode.lower(),
+        )
+    except (KeyError, ValueError, IndexError) as exc:
+        raise HTTPException(status_code=422, detail="receiver tuning template is invalid") from exc
+    base_host = item.base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    try:
+        url = validate_external_url(rendered, {base_host.lower()})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="receiver tuning URL failed host validation") from exc
+    return Envelope(data={"url": url})
 
 
 @router.get("/receivers/{receiver_id}", response_model=Envelope[dict[str, Any]])
@@ -478,11 +572,20 @@ def create_source(
 ) -> Envelope[dict[str, Any]]:
     if db.scalar(select(Source).where(Source.name == payload.name)):
         raise HTTPException(status_code=409, detail="source name already exists")
-    remote = payload.adapter_type in {"rss_atom", "generic_html_table"}
+    remote = payload.adapter_type in REMOTE_ADAPTER_TYPES
     if remote and not payload.base_url:
         raise HTTPException(status_code=422, detail="remote adapter requires base_url")
     if payload.enabled and not remote:
         raise HTTPException(status_code=422, detail="only fetchable remote adapters can be enabled")
+    if (
+        payload.enabled
+        and payload.adapter_type == "websdr_directory"
+        and not payload.config.get("terms_approved")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="websdr_directory requires config.terms_approved=true after obtaining source permission",
+        )
     if payload.base_url:
         allowed_hosts = {
             str(host).lower().rstrip(".")
@@ -516,6 +619,74 @@ def create_source(
     )
 
 
+@router.get("/sources/profiles", response_model=Envelope[list[dict[str, Any]]])
+def source_profiles(_user: CurrentUser) -> Envelope[list[dict[str, Any]]]:
+    """List maintained public catalogue profiles without installing them."""
+    return Envelope(data=list(PUBLIC_SOURCE_PROFILES.values()))
+
+
+@router.post("/sources/profiles/{profile_id}/install", response_model=Envelope[dict[str, Any]], status_code=201)
+def install_source_profile(
+    profile_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    profile = PUBLIC_SOURCE_PROFILES.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="public source profile not found")
+    existing = db.scalar(select(Source).where(Source.name == str(profile["name"])))
+    if existing is not None:
+        if existing.config.get("profile_id") != profile_id:
+            raise HTTPException(status_code=409, detail="a different source already uses this profile name")
+        requires_approval = bool(existing.config.get("requires_terms_approval", False))
+        existing.enabled = not requires_approval
+        if existing.enabled:
+            existing.last_fetched_at = datetime.now(UTC) - timedelta(
+                seconds=source_interval_sec(dict(existing.config))
+            )
+        db.commit()
+        return Envelope(
+            data=model_dict(existing),
+            warnings=(
+                ["existing profile enabled"]
+                if existing.enabled
+                else ["profile remains paused until its source terms are explicitly approved"]
+            ),
+        )
+    source = Source(
+        name=str(profile["name"]),
+        adapter_type=str(profile["adapter_type"]),
+        base_url=str(profile["base_url"]),
+        enabled=not bool(dict(profile["config"]).get("requires_terms_approval", False)),
+        parser_version="1.0.0",
+        license_notes=str(profile["license_notes"]),
+        config=dict(profile["config"]),
+        last_fetched_at=datetime.now(UTC) - timedelta(
+            seconds=source_interval_sec(dict(profile["config"]))
+        ),
+    )
+    db.add(source)
+    db.flush()
+    db.add(
+        AuditLog(
+            user_id=_user.id,
+            action="PUBLIC_SOURCE_PROFILE_INSTALLED",
+            target_type="SOURCE",
+            target_id=source.id,
+            detail={"profile_id": profile_id, "adapter_type": source.adapter_type},
+        )
+    )
+    db.commit()
+    return Envelope(
+        data=model_dict(source),
+        warnings=(
+            ["background collection enabled; first fetch is queued by Celery Beat"]
+            if source.enabled
+            else ["profile installed paused; source terms require operator approval before enablement"]
+        ),
+    )
+
+
 @router.get("/sources/{source_id}", response_model=Envelope[dict[str, Any]])
 def source(source_id: str, _user: CurrentUser, db: Session = Depends(get_db)) -> Envelope[dict[str, Any]]:
     item = db.get(Source, source_id)
@@ -535,11 +706,26 @@ def patch_source(
     if item is None or item.deleted_at is not None:
         raise HTTPException(status_code=404, detail="source not found")
     changes = payload.model_dump(exclude_unset=True)
-    if changes.get("enabled") and item.adapter_type not in {"rss_atom", "generic_html_table"}:
+    if changes.get("enabled") and item.adapter_type not in REMOTE_ADAPTER_TYPES:
         raise HTTPException(status_code=422, detail="source adapter is not remotely fetchable")
+    proposed_config_value = changes.get("config")
+    proposed_config: dict[str, Any] = (
+        proposed_config_value
+        if isinstance(proposed_config_value, dict)
+        else dict(item.config or {})
+    )
+    if (
+        changes.get("enabled")
+        and item.adapter_type == "websdr_directory"
+        and not proposed_config.get("terms_approved")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="websdr_directory remains paused until config.terms_approved=true is recorded",
+        )
     if "config" in changes and changes["config"] is not None:
         config = dict(changes["config"])
-        interval_sec = source_interval_sec(
+        source_interval_sec(
             {"interval_sec": config.get("interval_sec", item.config.get("interval_sec", 3_600))}
         )
         allowed_hosts = config.get("allowed_hosts", item.config.get("allowed_hosts", []))

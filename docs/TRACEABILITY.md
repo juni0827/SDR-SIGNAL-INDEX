@@ -31,7 +31,7 @@ Status meanings:
 | 20 | audio review | IMPLEMENTED | signed A/B media, waveform/spectrogram, loop/rate/gain, candidates, correction, entity/annotation/split/merge/VAD/review/keys | device/audio-output QA pending |
 | 21 | hypothesis notebook | IMPLEMENTED | layered evidence, sessions/events/queries, user/LLM notes, status history and report | real-stack workflow gate remains |
 | 22 | external events | IMPLEMENTED | manual CRUD UI/API, imports and non-causal correlation candidates | bulk import covered by generic adapters |
-| 23 | adapter plugin architecture | IMPLEMENTED | protocol + CSV/JSON/RSS/HTML/manual/static adapters | adapter tests |
+| 23 | adapter plugin architecture | IMPLEMENTED-WITH-VERIFY | protocol + CSV/JSON/RSS/HTML/manual/static plus WebSDR directory, KiwiSDR Receiverbook and Priyom calendar adapters; profile install; robots/rate/ETag/DLQ/provenance | live source runs need Compose verification; public sites can change markup/API |
 | 24 | capture scheduler | BLOCKED-VERIFY | persisted source/capture control plane, Beat dispatcher, Redis lock, receiver direct-audio opt-in, capacity/retention, safe FFmpeg capture | real permitted receiver stream and Compose run pending |
 | 25 | optional local LLM/browser agent | IMPLEMENTED | bounded server-side OpenAI-compatible call plus semantic/ARIA/permalink API/UI | local endpoint availability remains optional |
 | 26 | LLM Tool API | IMPLEMENTED | required endpoints and Envelope | contract tests |

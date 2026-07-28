@@ -6,7 +6,8 @@ SDR Signal Index is a private, self-hosted PWA that preserves, processes, indexe
 
 ```text
 Data sources
-  CSV / JSON / manual / RSS / HTML tables / static sources / permitted receiver capture / user audio
+  CSV / JSON / manual / RSS / HTML tables / public WebSDR & KiwiSDR directories /
+  Priyom public schedule / static sources / permitted receiver capture / user audio
        │
        ▼
 Source adapters ── polite fetch, validation, dedup, raw archive, provenance, DLQ
@@ -39,7 +40,7 @@ Observed facts, machine results, user corrections, user interpretations, local-L
 ├── workers/audio_processor     Celery audio and source workers
 ├── packages
 │   ├── signal_processing       FFmpeg, VAD, features, entities, grouping, embeddings
-│   └── source_adapters         adapter protocol and seven generic adapters
+│   └── source_adapters         adapter protocol, generic imports, public-catalogue adapters
 ├── infra
 │   ├── docker                  API, worker, and web images
 │   └── migrations              Alembic schema and PostgreSQL indexes
@@ -149,8 +150,11 @@ Once configured, collection and processing continue when no browser is open.
 3. Explicitly confirm continuous capture for that receiver.
 4. In **Capture**, create an enabled schedule with a first UTC run and repeat
    cron, duration, storage cap, and retention policy.
-5. In **Sources**, register an RSS/Atom or generic HTML-table source, select a
-   5-minute-or-longer interval, and enable it.
+5. In **Sources**, click **Connect & schedule** for the maintained KiwiSDR and
+   Priyom catalogue profiles, or register an RSS/Atom/generic HTML-table
+   source. The WebSDR directory adapter is installed paused because its source
+   requires prior permission for automated reuse. Select a 5-minute-or-longer
+   interval for custom sources.
 
 Celery Beat checks due capture jobs every 30 seconds, due sources every 60
 seconds, and receiver status every 10 minutes. `GET /api/v1/automation/status`
@@ -162,6 +166,29 @@ do not expose one universal, stable audio-stream protocol, and sites can impose
 different terms. Signal Index will only invoke an owner-supplied direct stream
 template that passes same-host and SSRF validation; it never bulk-records a
 directory merely because it was discovered.
+
+### Public receiver and frequency catalogue profiles
+
+The maintained profiles install persistent `Source` records and are collected
+by Celery Beat even when Signal Index is closed in every browser:
+
+- **WebSDR directory (permission required)** — parses the official JSON only
+  after the owner has documented the source's required permission and records
+  `terms_approved=true`; the profile installs paused by default.
+- **KiwiSDR public receiver directory (Receiverbook)** — bounded, polite
+  daily refresh of the listed KiwiSDR endpoints.
+- **Priyom number-station schedule** — six-hour refresh of the public calendar
+  into attributed `NUMBERS` frequency entries with station, frequency, mode,
+  scheduled UTC, raw response hash, and license note.
+
+The adapters check the source's robots policy, pin the configured hostname,
+rate-limit each domain, retain ETag/Last-Modified where meaningful, archive raw
+responses when enabled, and send failures through the source dead-letter path.
+Profiles are **catalogue discovery and indexing**, not a grant to record audio.
+Each discovered receiver has an **Open tuned receiver** control: it renders a
+same-host browser tuning link and never starts capture. To collect audio 24/7,
+you must still configure an authorised direct-audio transport and a Capture
+schedule as described above.
 
 ## Development commands
 

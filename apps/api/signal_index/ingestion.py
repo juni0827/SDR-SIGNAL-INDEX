@@ -58,6 +58,7 @@ def materialize_record(
 
     data = record.data
     record_type = record.record_type.upper()
+    created = True
     if record_type == "FREQUENCY":
         item: Any = FrequencyEntry(
             frequency_hz=int(data["frequency_hz"]),
@@ -81,25 +82,51 @@ def materialize_record(
             notes=_optional_string(data.get("notes")),
         )
     elif record_type == "RECEIVER":
-        item = Receiver(
-            name=str(data["name"]),
-            receiver_type=str(data.get("receiver_type") or "OTHER").upper(),
-            base_url=str(data["base_url"]),
-            country_code=_optional_string(data.get("country_code")),
-            latitude=float(data["latitude"]) if data.get("latitude") not in {None, ""} else None,
-            longitude=float(data["longitude"]) if data.get("longitude") not in {None, ""} else None,
-            grid_locator=_optional_string(data.get("grid_locator")),
-            min_frequency_hz=(
-                int(data["min_frequency_hz"]) if data.get("min_frequency_hz") else None
-            ),
-            max_frequency_hz=(
-                int(data["max_frequency_hz"]) if data.get("max_frequency_hz") else None
-            ),
-            supported_modes=_string_list(data.get("supported_modes")),
-            status=str(data.get("status") or "UNKNOWN").upper(),
-            metadata_json=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
-            tuning_url_template=_optional_string(data.get("tuning_url_template")),
+        existing_receiver = db.scalar(
+            select(Receiver).where(
+                Receiver.base_url == str(data["base_url"]),
+                Receiver.deleted_at.is_(None),
+            )
         )
+        if existing_receiver is None:
+            item = Receiver(
+                name=str(data["name"]),
+                receiver_type=str(data.get("receiver_type") or "OTHER").upper(),
+                base_url=str(data["base_url"]),
+                country_code=_optional_string(data.get("country_code")),
+                latitude=float(data["latitude"]) if data.get("latitude") not in {None, ""} else None,
+                longitude=float(data["longitude"]) if data.get("longitude") not in {None, ""} else None,
+                grid_locator=_optional_string(data.get("grid_locator")),
+                min_frequency_hz=(
+                    int(data["min_frequency_hz"]) if data.get("min_frequency_hz") else None
+                ),
+                max_frequency_hz=(
+                    int(data["max_frequency_hz"]) if data.get("max_frequency_hz") else None
+                ),
+                supported_modes=_string_list(data.get("supported_modes")),
+                status=str(data.get("status") or "UNKNOWN").upper(),
+                metadata_json=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+                tuning_url_template=_optional_string(data.get("tuning_url_template")),
+            )
+        else:
+            # Directory refreshes must not overwrite an owner's capture
+            # transport or bookmark.  Merge only provenance-facing catalogue
+            # metadata and retain the established receiver identity.
+            item = existing_receiver
+            metadata = dict(item.metadata_json or {})
+            discovered_value = data.get("metadata")
+            discovered: dict[str, Any] = (
+                discovered_value if isinstance(discovered_value, dict) else {}
+            )
+            metadata["directory_url"] = discovered.get("directory_url", metadata.get("directory_url"))
+            metadata["directory_adapter"] = discovered.get(
+                "directory_adapter", metadata.get("directory_adapter")
+            )
+            metadata["catalogue_only"] = bool(discovered.get("catalogue_only", True))
+            item.metadata_json = metadata
+            if item.tuning_url_template is None:
+                item.tuning_url_template = _optional_string(data.get("tuning_url_template"))
+            created = False
     elif record_type == "EVENT":
         item = ExternalEvent(
             title=str(data["title"]),
@@ -139,4 +166,4 @@ def materialize_record(
             raw_object_key=raw_object_key,
         )
     )
-    return item.id, True
+    return item.id, created

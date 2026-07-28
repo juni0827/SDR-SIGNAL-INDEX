@@ -16,6 +16,11 @@ from signal_index.security import validate_external_url
 from signal_index.storage import ObjectStorage
 from source_adapters.adapters import HTMLTableAdapter, RSSAtomAdapter
 from source_adapters.base import SourceAdapter
+from source_adapters.public_catalogs import (
+    KiwiSDRDirectoryAdapter,
+    PriyomScheduleAdapter,
+    WebSDRDirectoryAdapter,
+)
 from sqlalchemy import select
 
 from .celery_app import celery
@@ -55,6 +60,28 @@ def fetch_source(self: Task, source_id: str) -> dict[str, int | str]:
             url,
             str(config.get("record_type", "FREQUENCY")),
             str(config.get("table_selector", "table")),
+            allowed_hosts,
+            etag=etag,
+            last_modified=last_modified,
+        )
+    elif adapter_type == "websdr_directory":
+        adapter = WebSDRDirectoryAdapter(
+            url,
+            allowed_hosts,
+            etag=etag,
+            last_modified=last_modified,
+        )
+    elif adapter_type == "kiwisdr_directory":
+        adapter = KiwiSDRDirectoryAdapter(
+            url,
+            allowed_hosts,
+            max_pages=int(config.get("max_pages", 1)),
+            etag=etag,
+            last_modified=last_modified,
+        )
+    elif adapter_type == "priyom_schedule":
+        adapter = PriyomScheduleAdapter(
+            url,
             allowed_hosts,
             etag=etag,
             last_modified=last_modified,
@@ -133,7 +160,15 @@ def dispatch_due_sources() -> dict[str, int]:
                 select(Source).where(
                     Source.enabled.is_(True),
                     Source.deleted_at.is_(None),
-                    Source.adapter_type.in_(["rss_atom", "generic_html_table"]),
+                    Source.adapter_type.in_(
+                        [
+                            "rss_atom",
+                            "generic_html_table",
+                            "websdr_directory",
+                            "kiwisdr_directory",
+                            "priyom_schedule",
+                        ]
+                    ),
                 )
             )
         )

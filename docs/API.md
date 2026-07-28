@@ -59,10 +59,13 @@ POST /api/v1/local-llm/chat
 GET  /api/v1/realtime/events
 GET  /api/v1/automation/status
 PATCH /api/v1/receivers/{id}/capture
+GET  /api/v1/receivers/{id}/tune?frequency_hz={hz}&mode={mode}
 POST /api/v1/capture
 PATCH /api/v1/capture/{id}
 POST /api/v1/capture/{id}/run-now
 POST /api/v1/sources
+GET  /api/v1/sources/profiles
+POST /api/v1/sources/profiles/{profile_id}/install
 PATCH /api/v1/sources/{id}
 POST /api/v1/sources/{id}/fetch
 ```
@@ -107,3 +110,14 @@ Templates support only `{frequency_hz}`, `{frequency_khz}`, and `{mode}`. Then
 create or enable a capture schedule. `CAPTURE_ENABLED=true` must be set in the
 worker and scheduler environment. Sources and schedules are persisted in
 PostgreSQL, so Celery Beat and workers continue without an open browser.
+
+`GET /api/v1/sources/profiles` exposes maintained catalogue profiles for the
+public WebSDR directory, the Receiverbook KiwiSDR directory, and Priyom's
+public number-station calendar. `POST /api/v1/sources/profiles/{profile_id}/install`
+creates (or re-enables) an auditable `Source`. The WebSDR profile remains
+paused until its required reuse permission is recorded as `terms_approved`.
+Other profiles are background-enabled. These
+profiles materialize receiver or frequency *catalogue* data and preserve
+provenance; they do not enable audio recording. `GET /receivers/{id}/tune`
+renders a same-host browser tuning link when a receiver has a verified tuning
+template, otherwise it returns the receiver home page with a warning.

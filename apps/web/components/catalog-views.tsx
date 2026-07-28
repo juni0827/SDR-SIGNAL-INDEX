@@ -286,6 +286,22 @@ function ReceiverCaptureControl({ receiver }: { receiver: Row }) {
   }}><label>Direct audio URL template<input name="capture_url_template" type="text" inputMode="url" defaultValue={String(metadata.capture_url_template ?? "")} placeholder="https://receiver.example/audio?freq={frequency_hz}&mode={mode}"/></label><label><input name="capture_enabled" type="checkbox" defaultChecked={Boolean(metadata.capture_enabled)}/> I am authorised to capture from this receiver continuously</label><button disabled={save.isPending}>Save capture transport</button>{message ? <p role="status">{message}</p> : null}{save.error ? <p role="alert">{save.error.message}</p> : null}</form></section>;
 }
 
+function ReceiverTuneControl({ receiver }: { receiver: Row }) {
+  const [frequencyHz, setFrequencyHz] = useState(4_625_000);
+  const [mode, setMode] = useState("USB");
+  const [message, setMessage] = useState("");
+  const tune = useMutation({
+    mutationFn: () => api<Envelope<{ url: string }>>(
+      `/receivers/${encodeURIComponent(String(receiver.id))}/tune?frequency_hz=${frequencyHz}&mode=${encodeURIComponent(mode)}`,
+    ),
+    onSuccess: response => {
+      setMessage(response.warnings[0] ?? "Opening receiver tuning page.");
+      window.open(response.data.url, "_blank", "noopener,noreferrer");
+    },
+  });
+  return <section className="receiver-capture-control"><h3>Browser tuning link</h3><p>This opens the public receiver UI at the requested frequency. It is not an audio capture command.</p><div className="form-grid"><label>Frequency Hz<input value={frequencyHz} min="0" type="number" onChange={event => setFrequencyHz(Number(event.target.value) || 0)}/></label><label>Mode<input value={mode} maxLength={20} onChange={event => setMode(event.target.value.toUpperCase())}/></label></div><button className="primary" onClick={() => tune.mutate()} disabled={tune.isPending}>Open tuned receiver</button>{message ? <p role="status">{message}</p> : null}{tune.error ? <p role="alert">{tune.error.message}</p> : null}</section>;
+}
+
 export function ReceiversView({ id }: { id?: string }) {
   const list = useApi<Row[]>(["receivers"], "/receivers?limit=500");
   const detail = useApi<Row>(["receiver", id], id ? `/receivers/${encodeURIComponent(id)}` : "/capabilities");
@@ -294,7 +310,7 @@ export function ReceiversView({ id }: { id?: string }) {
   const selected = id ? detail.data?.data : undefined;
   return (
     <DataState loading={list.isLoading || (Boolean(id) && detail.isLoading)} error={list.error || (id ? detail.error : null)} empty={rows.length === 0}>
-      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred. Nearby receivers are clustered.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver</a><ReceiverCaptureControl receiver={selected}/><h3>Status history</h3>{(history.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.status)}</b><br/><span>{String(row.created_at)} · {String(row.latency_ms ?? "—")} ms</span></p>)}</> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
+      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred. Nearby receivers are clustered.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver home</a><ReceiverTuneControl receiver={selected}/><ReceiverCaptureControl receiver={selected}/><h3>Status history</h3>{(history.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.status)}</b><br/><span>{String(row.created_at)} · {String(row.latency_ms ?? "—")} ms</span></p>)}</> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
     </DataState>
   );
 }
