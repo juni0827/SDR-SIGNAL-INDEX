@@ -140,12 +140,18 @@ The first account is created from `FIRST_USER_EMAIL` and `FIRST_USER_PASSWORD`. 
 
 [Open this repository in GitHub Codespaces](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=juni0827%2FSDR-SIGNAL-INDEX)
 
-Codespaces creates the Docker development environment, starts PostgreSQL, Redis,
-MinIO, API, web, worker, and scheduler, then opens the private forwarded PWA port
-(`3000`). It seeds the synthetic dataset only when the database is empty, so the
-Spectrum explorer has data immediately. Browser API traffic is same-origin through
-the Next.js `/api/v1` proxy, therefore the forwarded PWA address works without
-editing `NEXT_PUBLIC_API_URL` or exposing an API key.
+Codespaces creates a lightweight editor container first, then automatically starts
+PostgreSQL, Redis, MinIO, API, and the web PWA. Port `3000` opens privately in the
+browser as soon as that core is healthy. The audio worker and scheduler then build
+in the background, so model dependencies cannot block inspection of the UI. It
+seeds the synthetic dataset only when the database is empty, so the Spectrum
+explorer has data immediately. Browser API traffic is same-origin through the
+Next.js `/api/v1` proxy, therefore the forwarded PWA address works without editing
+`NEXT_PUBLIC_API_URL` or exposing an API key.
+
+For an existing Codespace created before this configuration, close it and use the
+link above to create a new one; no terminal command is needed. New Codespaces open
+the PWA automatically after the first build.
 
 This is a full development stack rather than GitHub Pages: the browser URL is a
 private forwarded `app.github.dev` address, while the application itself listens

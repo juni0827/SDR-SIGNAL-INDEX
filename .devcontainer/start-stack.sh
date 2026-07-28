@@ -5,7 +5,24 @@ if [ ! -f .env ]; then
   cp .env.example .env
 fi
 
-docker compose up -d --build postgres redis minio minio-init api web worker scheduler
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Codespaces Docker CLI is unavailable; rebuild this Codespace from the repository devcontainer configuration." >&2
+  exit 1
+fi
+
+# postStart runs on every resume. A non-blocking lock makes that idempotent
+# instead of launching concurrent image builds.
+exec 9>.codespaces/start.lock
+if ! flock -n 9; then
+  exit 0
+fi
+
+if curl --fail --silent --show-error http://localhost:3000 >/dev/null 2>&1; then
+  exit 0
+fi
+
+echo "[Signal Index] Starting PWA core services..."
+docker compose up -d --build postgres redis minio minio-init api web
 
 for attempt in $(seq 1 60); do
   if curl --fail --silent --show-error http://localhost:8000/api/v1/health >/dev/null; then
@@ -25,3 +42,10 @@ done
 if ! docker compose exec -T api python -c 'from signal_index.database import SessionLocal; from signal_index.models import User; s=SessionLocal(); print(s.query(User).count()); s.close()' | tail -1 | grep -qx '[1-9][0-9]*'; then
   docker compose exec -T api python scripts/seed/seed.py
 fi
+
+# Audio workers are intentionally detached from the interactive start path.
+# They continue building and starting after port 3000 is already usable.
+echo "[Signal Index] PWA ready on forwarded port 3000; starting background workers..."
+(docker compose up -d --build worker scheduler >.codespaces/worker-start.log 2>&1 || {
+  echo "[Signal Index] Background worker start failed. See .codespaces/worker-start.log" >&2
+}) &

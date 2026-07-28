@@ -5,6 +5,7 @@ node_modules/
 .pip-cache/
 .playwright-browsers/
 .next/
+.codespaces/
 dist/
 coverage/
 __pycache__/

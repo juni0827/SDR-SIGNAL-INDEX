@@ -1,9 +1,6 @@
 {
   "name": "SDR Signal Index",
-  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.codespaces.yml"],
-  "service": "workspace",
-  "workspaceFolder": "/workspaces/signal-index",
-  "shutdownAction": "stopCompose",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "features": {
     "ghcr.io/devcontainers/features/node:1": { "version": "22" }
   },
