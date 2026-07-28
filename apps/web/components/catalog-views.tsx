@@ -42,20 +42,35 @@ export function SessionTable({ rows }: { rows: Row[] }) {
 }
 
 export function DashboardView() {
+  const dashboardWindow = useMemo(() => {
+    const end = new Date();
+    return {
+      start: new Date(end.getTime() - 7 * 86_400_000).toISOString(),
+      end: end.toISOString(),
+    };
+  }, []);
   const analytics = useApi<Row>(["analytics-summary"], "/analytics/summary");
-  const sessions = useApi<Row[]>(["dashboard-sessions"], "/search/sessions", { method: "POST", body: JSON.stringify({ limit: 8 }) });
+  const activity = useApi<Row>(
+    ["dashboard-activity", dashboardWindow],
+    `/analytics/activity?start_at_utc=${encodeURIComponent(dashboardWindow.start)}&end_at_utc=${encodeURIComponent(dashboardWindow.end)}`,
+  );
+  const sessions = useApi<Row[]>(["dashboard-sessions"], "/search/sessions", { method: "POST", body: JSON.stringify({ limit: 10 }) });
+  const unreviewedSegments = useApi<Row[]>(["dashboard-unreviewed"], "/search/segments", { method: "POST", body: JSON.stringify({ reviewed: false, limit: 8 }) });
   const receivers = useApi<Row[]>(["dashboard-receivers"], "/receivers?limit=100");
   const hypotheses = useApi<Row[]>(["dashboard-hypotheses"], "/hypotheses?limit=5");
+  const events = useApi<Row[]>(["dashboard-events"], "/events?limit=5");
   const frequencies = useApi<Row[]>(["dashboard-frequencies"], "/frequencies?limit=500");
-  const captures = useApi<Row[]>(["dashboard-captures"], "/capture?limit=20");
   const savedQueries = useApi<Row[]>(["dashboard-saved-queries"], "/saved-queries?limit=10");
   const health = useApi<Row>(["dashboard-health"], "/health");
   const automation = useApi<Row>(["automation-status"], "/automation/status");
-  const error = analytics.error || sessions.error || receivers.error || hypotheses.error || frequencies.error || captures.error || savedQueries.error || health.error || automation.error;
+  const error = analytics.error || activity.error || sessions.error || unreviewedSegments.error || receivers.error || hypotheses.error || events.error || frequencies.error || savedQueries.error || health.error || automation.error;
   const summary = analytics.data?.data ?? {};
+  const activityData = activity.data?.data ?? {};
   const sessionRows = sessions.data?.data ?? [];
+  const reviewRows = unreviewedSegments.data?.data ?? [];
   const receiverRows = receivers.data?.data ?? [];
   const hypothesisRows = hypotheses.data?.data ?? [];
+  const eventRows = events.data?.data ?? [];
   const watchlist = (frequencies.data?.data ?? []).filter(row => row.watchlisted);
   const failedJobs = (summary.failed_jobs as Row[] | undefined) ?? [];
   const storage = (summary.storage as Row | undefined) ?? {};
@@ -64,28 +79,56 @@ export function DashboardView() {
   const automationCaptures = (automationData.captures as Row | undefined) ?? {};
   const automationSources = (automationData.sources as Row | undefined) ?? {};
   const scheduler = (automationData.scheduler as Row | undefined) ?? {};
+  const dailyActivity = Object.entries((activityData.daily_activity as Record<string, number> | undefined) ?? {}).slice(-7);
+  const maxDailyActivity = Math.max(1, ...dailyActivity.map(([, count]) => Number(count)));
+  const topCallsigns = (summary.top_callsigns as Row[] | undefined) ?? [];
+  const topNumberGroups = (summary.top_number_groups as Row[] | undefined) ?? [];
+  const onlineReceivers = receiverRows.filter(row => row.status === "ONLINE").length;
+  const activeHypotheses = hypothesisRows.filter(row => ["ACTIVE", "DRAFT", "INCONCLUSIVE"].includes(String(row.status))).length;
+  const operatorAttention = failedJobs.length + reviewRows.length + Number(automationCaptures.failed ?? 0);
   return (
-    <DataState loading={analytics.isLoading || sessions.isLoading} error={error} empty={false}>
-      <div className="dashboard" data-testid="dashboard-live">
-        <section className="stats">
-          {[
-            ["Sessions", summary.session_count ?? sessionRows.length],
-            ["Active duration", `${Math.round(Number(summary.active_duration_sec ?? 0))} s`],
-            ["Receiver coverage", summary.receiver_coverage ?? receiverRows.length],
-            ["Unreviewed", sessionRows.filter(row => row.status === "UNREVIEWED").length],
-            ["Storage", storage.size_bytes != null ? `${(Number(storage.size_bytes) / 1_048_576).toFixed(1)} MiB` : String(storage.status ?? "unknown")],
-            ["Worker", String((components.worker as Row | undefined)?.status ?? "unknown")],
-            ["24/7 capture", scheduler.capture_globally_enabled ? `${String(automationCaptures.enabled ?? 0)} schedules` : "disabled in env"],
-          ].map(([label, value]) => <article key={String(label)}><span>{String(label)}</span><b>{String(value)}</b><small>Live indexed value</small></article>)}
+    <DataState loading={analytics.isLoading || activity.isLoading || sessions.isLoading} error={error} empty={false}>
+      <div className="command-deck" data-testid="dashboard-live">
+        <section className="deck-header">
+          <div><span className="kicker">SIGNAL INDEX / COMMAND DECK</span><h2>Observation operations</h2><p>Autonomous collection, review backlog, and analytic leads in one operational surface.</p></div>
+          <div className="deck-actions"><Link className="primary" href="/inbox">Add observation</Link><Link href="/capture">Configure capture</Link><Link href="/sessions">Search index</Link></div>
         </section>
-        <section className="panel recent"><header><div><span className="kicker">RECENT SESSIONS</span><h2>Indexed transmissions</h2></div><Link href="/sessions">View all</Link></header>{sessionRows.length ? <SessionTable rows={sessionRows}/> : <p className="notice">No sessions have been processed.</p>}</section>
-        <aside className="panel watch"><span className="kicker">RECEIVERS</span><h2>Status</h2>{receiverRows.length ? receiverRows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><small>{String(row.receiver_type)} · {String(row.status)}</small></div></Link>) : <p>No receivers registered.</p>}</aside>
-        <aside className="panel entities"><span className="kicker">REPEATED ENTITIES</span><h2>Current index</h2><p><Layer kind="machine"/><b>{String((summary.top_callsigns as Row[] | undefined)?.[0]?.value ?? "None")}</b></p><p><Layer kind="machine"/><b>{String((summary.top_number_groups as Row[] | undefined)?.[0]?.value ?? "None")}</b></p></aside>
-        <aside className="panel failures"><span className="kicker">PROCESSING FAILURES</span><h2>Action required</h2>{failedJobs.length ? failedJobs.map(row => <p key={String(row.id)}><i/><b>{String(row.stage)}</b><br/>{String(row.error_code ?? row.error_stderr ?? "Failed")}</p>) : <p>No failed jobs.</p>}</aside>
-        <aside className="panel watch"><span className="kicker">WATCHLIST</span><h2>Frequencies</h2>{watchlist.length ? watchlist.slice(0, 8).map(row => <Link href={`/frequencies/${String(row.frequency_hz)}`} key={String(row.id)}><div><b>{formatFrequency(row.frequency_hz)}</b><small>{String(row.label)}</small></div></Link>) : <p>No watchlisted frequencies.</p>}</aside>
-        <aside className="panel failures"><span className="kicker">AUTOMATION</span><h2>Runs without browser</h2><p><b>{String(automationSources.enabled ?? 0)}</b> continuous sources · <b>{String(automationCaptures.enabled ?? 0)}</b> capture schedules</p><p><b>{String(automationCaptures.active ?? 0)}</b> active capture/analysis jobs</p>{automation.data?.warnings?.map(warning => <p role="alert" key={warning}>{warning}</p>)}<Link href="/capture">Configure capture</Link></aside>
-        <aside className="panel failures"><span className="kicker">HYPOTHESES</span><h2>Recent</h2>{hypothesisRows.length ? hypothesisRows.map(row => <p key={String(row.id)}><Link href={`/hypotheses/${String(row.id)}`}>{String(row.title)}</Link></p>) : <p>No hypotheses.</p>}</aside>
-        <aside className="panel failures"><span className="kicker">SAVED QUERIES</span><h2>Reusable</h2>{(savedQueries.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.name)}</b><br/>{String(row.query_type)}</p>)}</aside>
+
+        <section className="deck-metrics" aria-label="Operational summary">
+          {[
+            ["Attention", operatorAttention, operatorAttention > 0 ? "attention" : "clear", "review + failures"],
+            ["Sessions", summary.session_count ?? sessionRows.length, "neutral", "indexed total"],
+            ["Review queue", reviewRows.length, reviewRows.length ? "attention" : "clear", "unreviewed segments"],
+            ["Receivers", `${onlineReceivers}/${receiverRows.length}`, onlineReceivers ? "clear" : "muted", "online / known"],
+            ["Automation", scheduler.capture_globally_enabled ? `${String(automationCaptures.enabled ?? 0)} armed` : "off", scheduler.capture_globally_enabled ? "clear" : "attention", `${String(automationSources.enabled ?? 0)} source feeds`],
+            ["Storage", storage.size_bytes != null ? `${(Number(storage.size_bytes) / 1_048_576).toFixed(1)} MiB` : String(storage.status ?? "unknown"), "neutral", "private object store"],
+          ].map(([label, value, tone, detail]) => <article className={`metric ${String(tone)}`} key={String(label)}><span>{String(label)}</span><b>{String(value)}</b><small>{String(detail)}</small></article>)}
+        </section>
+
+        <section className="panel deck-priority">
+          <header><div><span className="kicker">OPERATOR QUEUE</span><h2>What needs a decision</h2></div><Link href="/segments">Open review</Link></header>
+          <div className="priority-grid">
+            <article><span className="priority-label">UNREVIEWED SEGMENTS</span>{reviewRows.length ? reviewRows.slice(0, 4).map(row => <Link href={`/segments/${String(row.id)}`} className="priority-row" key={String(row.id)}><b>{String(row.segment_type)} · {Number(row.duration_sec ?? 0).toFixed(1)} s</b><small>Segment {String(row.id).slice(0, 8)} · {String(row.created_at ?? "UTC pending")}</small></Link>) : <p className="empty-state">No segment review is waiting.</p>}</article>
+            <article><span className="priority-label">FAILED / BLOCKED</span>{failedJobs.length ? failedJobs.slice(0, 3).map(row => <Link href={`/recordings/${String(row.recording_id)}`} className="priority-row critical" key={String(row.id)}><b>{String(row.stage)}</b><small>{String(row.error_code ?? row.error_stderr ?? "Processing failed")}</small></Link>) : <p className="empty-state">No processing failures.</p>}{automation.data?.warnings?.map(warning => <Link href="/capture" className="priority-row warning" key={warning}><b>Automation warning</b><small>{warning}</small></Link>)}</article>
+            <article><span className="priority-label">ACTIVE ANALYSIS</span>{hypothesisRows.length ? hypothesisRows.slice(0, 3).map(row => <Link href={`/hypotheses/${String(row.id)}`} className="priority-row" key={String(row.id)}><b>{String(row.title)}</b><small>{String(row.status)} · {Math.round(Number(row.confidence ?? 0) * 100)}%</small></Link>) : <p className="empty-state">No active hypothesis.</p>}<Link className="queue-cta" href="/hypotheses/new">Create hypothesis →</Link></article>
+          </div>
+        </section>
+
+        <section className="panel deck-activity">
+          <header><div><span className="kicker">ACTIVITY RADAR</span><h2>Seven-day session pulse</h2></div><Link href="/timeline">Open timeline</Link></header>
+          <div className="activity-radar" aria-label="Seven-day session activity">{dailyActivity.length ? dailyActivity.map(([day, count]) => <div key={day} title={`${day}: ${count} sessions`}><i style={{ height: `${Math.max(8, Number(count) / maxDailyActivity * 100)}%` }}/><span>{day.slice(5)}</span><b>{count}</b></div>) : <p className="empty-state">No session activity in this window.</p>}</div>
+          <footer><span>{String(activityData.activity_count ?? 0)} observations · {Math.round(Number(activityData.active_duration_sec ?? 0))} active seconds</span><span>UTC window ending {dashboardWindow.end.slice(0, 16).replace("T", " ")}</span></footer>
+        </section>
+
+        <section className="panel deck-sessions"><header><div><span className="kicker">LIVE INDEX</span><h2>Latest indexed sessions</h2></div><Link href="/sessions">Session explorer</Link></header>{sessionRows.length ? <SessionTable rows={sessionRows}/> : <p className="empty-state">Awaiting first indexed session.</p>}</section>
+
+        <section className="panel deck-watchlist"><header><div><span className="kicker">WATCHLIST</span><h2>Frequency focus</h2></div><Link href="/frequencies">Spectrum</Link></header>{watchlist.length ? <div className="watchlist-grid">{watchlist.slice(0, 8).map(row => <Link href={`/frequencies/${String(row.frequency_hz)}`} key={String(row.id)}><b>{formatFrequency(row.frequency_hz)}</b><small>{String(row.label)}</small><span>{String(row.mode ?? "—")} · {String(row.category)}</span></Link>)}</div> : <p className="empty-state">No watched frequency. Add one from Spectrum.</p>}</section>
+
+        <section className="panel deck-automation"><header><div><span className="kicker">AUTONOMOUS COLLECTION</span><h2>Worker and receiver posture</h2></div><Link href="/capture">Control plane</Link></header><div className="automation-grid"><article><span>Worker</span><b>{String((components.worker as Row | undefined)?.status ?? "UNKNOWN")}</b><small>{String(automationData.processing ? (automationData.processing as Row).active : 0)} processing jobs</small></article><article><span>Scheduler</span><b>{scheduler.capture_globally_enabled ? "ARMED" : "DISABLED"}</b><small>{String(automationCaptures.active ?? 0)} active · {String(automationCaptures.failed ?? 0)} failed</small></article><article><span>Receivers</span><b>{onlineReceivers} online</b><small>{String((automationData.receivers as Row | undefined)?.capture_configured ?? 0)} capture-configured</small></article><article><span>Feeds</span><b>{String(automationSources.enabled ?? 0)} active</b><small>{String(automationSources.active_fetches ?? 0)} fetching now</small></article></div></section>
+
+        <section className="panel deck-entities"><header><div><span className="kicker">ENTITY PULSE</span><h2>Repeated signals</h2></div><Link href="/graph">Relations</Link></header><div className="entity-columns"><article><span>CALLSIGNS</span>{topCallsigns.length ? topCallsigns.map(row => <p key={String(row.value)}><b>{String(row.value)}</b><small>{String(row.count)} occurrences</small></p>) : <p className="empty-state">None extracted.</p>}</article><article><span>NUMBER GROUPS</span>{topNumberGroups.length ? topNumberGroups.map(row => <p key={String(row.value)}><b>{String(row.value)}</b><small>{String(row.count)} occurrences</small></p>) : <p className="empty-state">None extracted.</p>}</article></div></section>
+
+        <section className="panel deck-notebook"><header><div><span className="kicker">INVESTIGATION NOTEBOOK</span><h2>Events and reusable queries</h2></div><span>{activeHypotheses} active hypotheses</span></header><div className="notebook-grid"><article><h3>External events</h3>{eventRows.length ? eventRows.slice(0, 4).map(row => <Link href={`/events/${String(row.id)}`} key={String(row.id)}><b>{String(row.title)}</b><small>{String(row.event_type)} · {String(row.started_at_utc ?? "time unknown")}</small></Link>) : <p className="empty-state">No external event recorded.</p>}</article><article><h3>Saved queries</h3>{(savedQueries.data?.data ?? []).slice(0, 4).map(row => <Link href={`/sessions?query=${encodeURIComponent(String(row.id))}`} key={String(row.id)}><b>{String(row.name)}</b><small>{String(row.query_type)}</small></Link>)}<Link className="queue-cta" href="/api-docs">Tool API / context bundle →</Link></article></div></section>
       </div>
     </DataState>
   );
