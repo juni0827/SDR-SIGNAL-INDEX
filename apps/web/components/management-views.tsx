@@ -102,11 +102,20 @@ export function InboxView() {
 
 export function SourcesView({ id }: { id?: string }) {
   const client = useQueryClient();
+  const [adapterType, setAdapterType] = useState("rss_atom");
   const list = useQuery({ queryKey: ["sources"], queryFn: () => api<Envelope<Row[]>>("/sources?limit=200") });
   const detail = useQuery({ queryKey: ["source", id], enabled: Boolean(id), queryFn: () => api<Envelope<Row>>(`/sources/${encodeURIComponent(id!)}`) });
   const create = useMutation({
     mutationFn: (payload: Row) => api<Envelope<Row>>("/sources", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => client.invalidateQueries({ queryKey: ["sources"] }),
+  });
+  const patch = useMutation({
+    mutationFn: (payload: Row) => api<Envelope<Row>>(`/sources/${encodeURIComponent(id!)}`, { method: "PATCH", body: JSON.stringify(payload) }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["source", id] });
+      void client.invalidateQueries({ queryKey: ["sources"] });
+      void client.invalidateQueries({ queryKey: ["automation-status"] });
+    },
   });
   const fetchNow = useMutation({ mutationFn: () => api(`/sources/${encodeURIComponent(id!)}/fetch`, { method: "POST", body: "{}" }) });
   const submit = (event: React.FormEvent<HTMLFormElement>) => {
@@ -114,22 +123,30 @@ export function SourcesView({ id }: { id?: string }) {
     const form = new FormData(event.currentTarget);
     const baseUrl = String(form.get("base_url") || "");
     const host = baseUrl ? new URL(baseUrl).hostname : "";
+    const enabled = form.get("enabled") === "on";
     create.mutate({
       name: String(form.get("name")),
-      adapter_type: String(form.get("adapter_type")),
+      adapter_type: adapterType,
       base_url: baseUrl || null,
-      enabled: false,
-      config: { record_type: String(form.get("record_type")), allowed_hosts: host ? [host] : [], interval_sec: 3600, archive_raw_response: true },
+      enabled,
+      config: {
+        record_type: String(form.get("record_type")),
+        allowed_hosts: host ? [host] : [],
+        interval_sec: Number(form.get("interval_sec")) || 3600,
+        archive_raw_response: true,
+      },
     });
   };
   if (id) {
     const row = detail.data?.data;
-    return <DataState loading={detail.isLoading} error={detail.error} empty={!row}>{row ? <section className="panel full"><Layer kind="observed"/><h2>{String(row.name)}</h2><pre>{JSON.stringify(row, null, 2)}</pre><button disabled={!row.enabled || fetchNow.isPending} onClick={() => fetchNow.mutate()}>Fetch now</button>{fetchNow.data ? <p role="status">Fetch queued.</p> : null}</section> : null}</DataState>;
+    const config = (row?.config as Row | undefined) ?? {};
+    const remote = row?.adapter_type === "rss_atom" || row?.adapter_type === "generic_html_table";
+    return <DataState loading={detail.isLoading} error={detail.error} empty={!row}>{row ? <section className="panel full"><Layer kind="observed"/><h2>{String(row.name)}</h2><p>{remote ? "This source is controlled by Celery Beat, not by this browser." : "Manual/static source; it is not fetched by the background scheduler."}</p><dl><dt>Adapter</dt><dd>{String(row.adapter_type)}</dd><dt>Last fetch UTC</dt><dd>{String(row.last_fetched_at ?? "never")}</dd><dt>Interval</dt><dd>{String(config.interval_sec ?? "—")} seconds</dd><dt>State</dt><dd>{row.enabled ? "Enabled for unattended collection" : "Paused"}</dd></dl>{remote ? <div className="toolbar"><button className="primary" disabled={patch.isPending} onClick={() => patch.mutate({ enabled: !row.enabled })}>{row.enabled ? "Pause background collection" : "Enable background collection"}</button><button disabled={!row.enabled || fetchNow.isPending} onClick={() => fetchNow.mutate()}>Fetch now</button></div> : null}{patch.error ? <p role="alert">{patch.error.message}</p> : null}{fetchNow.error ? <p role="alert">{fetchNow.error.message}</p> : null}{fetchNow.data ? <p role="status">Fetch queued; the worker continues independently of this page.</p> : null}<details><summary>Raw source configuration</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></section> : null}</DataState>;
   }
   return (
     <div className="split">
       <section className="panel"><h2>Registered sources</h2><DataState loading={list.isLoading} error={list.error} empty={(list.data?.data.length ?? 0) === 0}><div className="cards">{(list.data?.data ?? []).map(row => <Link href={`/sources/${String(row.id)}`} key={String(row.id)}><Layer kind="observed"/><h2>{String(row.name)}</h2><p>{String(row.adapter_type)} · {row.enabled ? "enabled" : "disabled"}</p></Link>)}</div></DataState></section>
-      <aside className="panel inbox-form"><h2>Register source</h2><form onSubmit={submit}><label>Name<input name="name" required/></label><label>Adapter<select name="adapter_type"><option value="rss_atom">RSS/Atom</option><option value="generic_html_table">HTML table</option><option value="user_defined_static">Static</option></select></label><label>Record type<select name="record_type"><option>EVENT</option><option>FREQUENCY</option><option>RECEIVER</option></select></label><label>URL<input name="base_url" type="url"/></label><button className="primary">Register disabled</button>{create.error ? <p role="alert">{create.error.message}</p> : null}</form><p className="policy">Remote sources are disabled by default and use an explicit host allowlist.</p></aside>
+      <aside className="panel inbox-form"><h2>Register source</h2><form onSubmit={submit}><label>Name<input name="name" required/></label><label>Adapter<select name="adapter_type" value={adapterType} onChange={event => setAdapterType(event.target.value)}><option value="rss_atom">RSS/Atom</option><option value="generic_html_table">HTML table</option><option value="user_defined_static">Static (manual)</option></select></label><label>Record type<select name="record_type"><option>EVENT</option><option>FREQUENCY</option><option>RECEIVER</option></select></label><label>URL<input name="base_url" type="url" required={adapterType !== "user_defined_static"}/></label><label>Poll interval seconds<input name="interval_sec" type="number" min="300" max="604800" defaultValue="3600" required disabled={adapterType === "user_defined_static"}/></label><label><input name="enabled" type="checkbox" defaultChecked={adapterType !== "user_defined_static"} disabled={adapterType === "user_defined_static"}/> Start unattended collection after registration</label><button className="primary">Register source</button>{create.error ? <p role="alert">{create.error.message}</p> : null}</form><p className="policy">The source hostname is pinned at registration. Enable only sources whose terms and robots policy permit collection.</p></aside>
     </div>
   );
 }
@@ -142,12 +159,21 @@ export function CaptureView() {
     mutationFn: (payload: Row) => api("/capture", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => client.invalidateQueries({ queryKey: ["captures"] }),
   });
+  const patch = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api(`/capture/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }),
+    onSuccess: () => { void client.invalidateQueries({ queryKey: ["captures"] }); void client.invalidateQueries({ queryKey: ["automation-status"] }); },
+  });
+  const runNow = useMutation({
+    mutationFn: (id: string) => api(`/capture/${encodeURIComponent(id)}/run-now`, { method: "POST", body: "{}" }),
+    onSuccess: () => { void client.invalidateQueries({ queryKey: ["captures"] }); },
+  });
   const submit = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    create.mutate({ receiver_id: form.get("receiver_id"), frequency_hz: Number(form.get("frequency_hz")), mode: form.get("mode"), schedule_utc: form.get("schedule_utc"), capture_duration_sec: Number(form.get("capture_duration_sec")), enabled: false, retention_policy: {} });
+    create.mutate({ receiver_id: form.get("receiver_id"), frequency_hz: Number(form.get("frequency_hz")), mode: form.get("mode"), schedule_utc: form.get("schedule_utc"), repetition: form.get("repetition") || null, capture_duration_sec: Number(form.get("capture_duration_sec")), maximum_storage_bytes: Number(form.get("maximum_storage_bytes")) || null, enabled: form.get("enabled") === "on", retention_policy: { days: Number(form.get("retention_days")) || 3650 } });
   };
-  return <div className="split"><section className="panel inbox-form"><h2>Explicit watchlist capture</h2><p>New schedules are deliberately saved disabled.</p><form onSubmit={submit}><label>Receiver<select name="receiver_id" required>{(receivers.data?.data ?? []).map(row => <option value={String(row.id)} key={String(row.id)}>{String(row.name)}</option>)}</select></label><label>Frequency Hz<input name="frequency_hz" type="number" required/></label><label>Mode<input name="mode" defaultValue="USB" required/></label><label>UTC ISO or cron<input name="schedule_utc" defaultValue="40 18 * * *" required/></label><label>Duration seconds<input name="capture_duration_sec" type="number" min="1" max="86400" defaultValue="60"/></label><button className="primary">Save disabled schedule</button>{create.error ? <p role="alert">{create.error.message}</p> : null}</form></section><aside className="panel"><h2>Capture jobs</h2><DataState loading={jobs.isLoading} error={jobs.error} empty={(jobs.data?.data.length ?? 0) === 0}>{(jobs.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.frequency_hz)} Hz</b><br/>{String(row.status)} · next {String(row.next_run_at)}</p>)}</DataState></aside></div>;
+  const configured = (receivers.data?.data ?? []).filter(row => Boolean((row.metadata_json as Row | undefined)?.capture_enabled) && Boolean((row.metadata_json as Row | undefined)?.capture_url_template));
+  return <div className="split"><section className="panel inbox-form"><h2>Unattended receiver capture</h2><p>After a receiver transport and this schedule are explicitly enabled, Celery Beat triggers capture every 30 seconds without this page or browser being open.</p><form onSubmit={submit}><label>Receiver<select name="receiver_id" required>{configured.map(row => <option value={String(row.id)} key={String(row.id)}>{String(row.name)}</option>)}</select></label>{configured.length === 0 ? <p role="alert">No receiver has an enabled direct-audio transport. Open a receiver and configure one first.</p> : null}<label>Frequency Hz<input name="frequency_hz" type="number" required/></label><label>Mode<input name="mode" defaultValue="USB" required/></label><label>First UTC run (ISO timestamp or five-field cron)<input name="schedule_utc" defaultValue="*/15 * * * *" required/></label><label>Repeat cron (blank = one run)<input name="repetition" defaultValue="*/15 * * * *"/></label><label>Duration seconds<input name="capture_duration_sec" type="number" min="1" max="86400" defaultValue="60"/></label><label>Maximum bytes per capture<input name="maximum_storage_bytes" type="number" min="1" defaultValue="25000000"/></label><label>Retention days<input name="retention_days" type="number" min="1" defaultValue="3650"/></label><label><input name="enabled" type="checkbox" defaultChecked disabled={configured.length === 0}/> Enable schedule now</label><button className="primary" disabled={configured.length === 0 || create.isPending}>Create autonomous schedule</button>{create.error ? <p role="alert">{create.error.message}</p> : null}</form></section><aside className="panel"><h2>Capture jobs</h2><DataState loading={jobs.isLoading} error={jobs.error} empty={(jobs.data?.data.length ?? 0) === 0}>{(jobs.data?.data ?? []).map(row => <article className="queue" key={String(row.id)}><b>{String(row.frequency_hz)} Hz · {String(row.mode)}</b><small>{String(row.status)} · next {String(row.next_run_at ?? "—")}</small>{row.last_error ? <small role="alert">{String(row.last_error)}</small> : null}<div className="toolbar"><button onClick={() => patch.mutate({ id: String(row.id), enabled: !row.enabled })} disabled={patch.isPending}>{row.enabled ? "Pause" : "Enable"}</button><button onClick={() => runNow.mutate(String(row.id))} disabled={!row.enabled || runNow.isPending}>Run now</button></div></article>)}</DataState>{runNow.error ? <p role="alert">{runNow.error.message}</p> : null}</aside></div>;
 }
 
 export function EventsView({ id }: { id?: string }) {

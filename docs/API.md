@@ -57,6 +57,14 @@ GET  /api/v1/export/data
 GET  /api/v1/export/hypotheses/{id}/report
 POST /api/v1/local-llm/chat
 GET  /api/v1/realtime/events
+GET  /api/v1/automation/status
+PATCH /api/v1/receivers/{id}/capture
+POST /api/v1/capture
+PATCH /api/v1/capture/{id}
+POST /api/v1/capture/{id}/run-now
+POST /api/v1/sources
+PATCH /api/v1/sources/{id}
+POST /api/v1/sources/{id}/fetch
 ```
 
 Search requests support bounded cursor pagination, frequency/date ranges, receiver, class, language, confidence, review/status/category, callsign and exact or normalized number group.
@@ -85,3 +93,17 @@ Search requests support bounded cursor pagination, frequency/date ranges, receiv
 Raw audio is never inserted into context. Items contain IDs and PWA permalinks. The server rejects a bundle whose estimated serialized size exceeds the requested token budget.
 
 The local-LLM endpoint is disabled by default, uses a server-side encrypted or environment API key, imposes prompt/output bounds, and returns its result explicitly labeled `LOCAL_LLM_HYPOTHESIS`.
+
+## Autonomous collection control plane
+
+`GET /api/v1/automation/status` reports persisted enabled sources and capture
+schedules, active/failed jobs, direct-audio receiver configuration, scheduler
+cadence, and environment blockers. It is safe for a local agent or monitoring
+dashboard; it returns no capture URL template or credential.
+
+For unattended capture the owner must first `PATCH /receivers/{id}/capture`
+with an authorised same-host direct-audio template and `capture_enabled=true`.
+Templates support only `{frequency_hz}`, `{frequency_khz}`, and `{mode}`. Then
+create or enable a capture schedule. `CAPTURE_ENABLED=true` must be set in the
+worker and scheduler environment. Sources and schedules are persisted in
+PostgreSQL, so Celery Beat and workers continue without an open browser.

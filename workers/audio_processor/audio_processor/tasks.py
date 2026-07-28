@@ -547,8 +547,20 @@ def process_recording(self: Task, recording_id: str, job_id: str) -> dict[str, A
                 select(CaptureJob).where(CaptureJob.recording_id == recording_id)
             )
             if capture_job:
-                capture_job.status = "FAILED" if self.request.retries >= self.max_retries else "PROCESSING"
+                terminal = self.request.retries >= self.max_retries
                 capture_job.last_error = error_stderr[-20_000:]
+                if terminal:
+                    capture_job.last_finished_at = datetime.now(UTC)
+                    capture_job.next_run_at = subsequent_schedule(
+                        capture_job.schedule_utc,
+                        capture_job.repetition,
+                        after=capture_job.last_finished_at,
+                    )
+                    capture_job.status = (
+                        "SCHEDULED" if capture_job.next_run_at is not None else "FAILED"
+                    )
+                else:
+                    capture_job.status = "PROCESSING"
         if self.request.retries >= self.max_retries:
             emit_event(
                 "failed_job",
@@ -586,6 +598,8 @@ def capture_receiver(self: Task, capture_job_id: str) -> dict[str, str]:
             receiver = db.get(Receiver, capture.receiver_id)
             if receiver is None or receiver.deleted_at is not None:
                 raise RuntimeError("capture receiver does not exist")
+            if not receiver.metadata_json.get("capture_enabled"):
+                raise RuntimeError("receiver capture transport is not explicitly enabled")
             template = str(receiver.metadata_json.get("capture_url_template") or "")
             if not template:
                 raise RuntimeError("receiver has no explicit capture_url_template")
@@ -706,8 +720,18 @@ def capture_receiver(self: Task, capture_job_id: str) -> dict[str, str]:
         with SessionLocal.begin() as db:
             capture = db.get(CaptureJob, capture_job_id)
             if capture:
-                capture.status = "FAILED" if self.request.retries >= self.max_retries else "STARTING"
+                terminal = self.request.retries >= self.max_retries
                 capture.last_error = f"{type(exc).__name__}: {exc}"[-20_000:]
+                if terminal:
+                    capture.last_finished_at = datetime.now(UTC)
+                    capture.next_run_at = subsequent_schedule(
+                        capture.schedule_utc,
+                        capture.repetition,
+                        after=capture.last_finished_at,
+                    )
+                    capture.status = "SCHEDULED" if capture.next_run_at is not None else "FAILED"
+                else:
+                    capture.status = "STARTING"
         if self.request.retries >= self.max_retries:
             emit_event(
                 "failed_job",

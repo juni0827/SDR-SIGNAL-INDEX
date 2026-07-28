@@ -6,7 +6,7 @@ SDR Signal Index is a private, self-hosted PWA that preserves, processes, indexe
 
 ```text
 Data sources
-  CSV / JSON / manual / RSS / HTML tables / static sources / user audio
+  CSV / JSON / manual / RSS / HTML tables / static sources / permitted receiver capture / user audio
        │
        ▼
 Source adapters ── polite fetch, validation, dedup, raw archive, provenance, DLQ
@@ -134,6 +134,34 @@ Open:
 - MinIO console: `http://localhost:9001`
 
 The first account is created from `FIRST_USER_EMAIL` and `FIRST_USER_PASSWORD`. Public registration is disabled.
+
+## Run autonomous collection while you are offline
+
+The web page is a control surface; it is not the collector. Docker Compose runs
+three independent services: `scheduler` (Celery Beat), `worker`, and `api`.
+Once configured, collection and processing continue when no browser is open.
+
+1. In `.env`, set `CAPTURE_ENABLED=true`, then restart the `worker` and
+   `scheduler` containers.
+2. In **Receivers**, open a receiver and register an authorised *direct audio*
+   URL template on that receiver's host. A browser tuning URL is not enough.
+   The template can use `{frequency_hz}`, `{frequency_khz}`, and `{mode}`.
+3. Explicitly confirm continuous capture for that receiver.
+4. In **Capture**, create an enabled schedule with a first UTC run and repeat
+   cron, duration, storage cap, and retention policy.
+5. In **Sources**, register an RSS/Atom or generic HTML-table source, select a
+   5-minute-or-longer interval, and enable it.
+
+Celery Beat checks due capture jobs every 30 seconds, due sources every 60
+seconds, and receiver status every 10 minutes. `GET /api/v1/automation/status`
+and the Dashboard expose persisted scheduler state, including warnings such as
+an enabled schedule with `CAPTURE_ENABLED=false`.
+
+Receiver recording is intentionally opt-in. WebSDR and KiwiSDR browser pages
+do not expose one universal, stable audio-stream protocol, and sites can impose
+different terms. Signal Index will only invoke an owner-supplied direct stream
+template that passes same-host and SSRF validation; it never bulk-records a
+directory merely because it was discovered.
 
 ## Development commands
 

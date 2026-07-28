@@ -50,7 +50,8 @@ export function DashboardView() {
   const captures = useApi<Row[]>(["dashboard-captures"], "/capture?limit=20");
   const savedQueries = useApi<Row[]>(["dashboard-saved-queries"], "/saved-queries?limit=10");
   const health = useApi<Row>(["dashboard-health"], "/health");
-  const error = analytics.error || sessions.error || receivers.error || hypotheses.error || frequencies.error || captures.error || savedQueries.error || health.error;
+  const automation = useApi<Row>(["automation-status"], "/automation/status");
+  const error = analytics.error || sessions.error || receivers.error || hypotheses.error || frequencies.error || captures.error || savedQueries.error || health.error || automation.error;
   const summary = analytics.data?.data ?? {};
   const sessionRows = sessions.data?.data ?? [];
   const receiverRows = receivers.data?.data ?? [];
@@ -58,7 +59,11 @@ export function DashboardView() {
   const watchlist = (frequencies.data?.data ?? []).filter(row => row.watchlisted);
   const failedJobs = (summary.failed_jobs as Row[] | undefined) ?? [];
   const storage = (summary.storage as Row | undefined) ?? {};
-  const components = (health.data?.data.components as Row | undefined) ?? {};
+  const components = (health.data?.data.checks as Row | undefined) ?? {};
+  const automationData = automation.data?.data ?? {};
+  const automationCaptures = (automationData.captures as Row | undefined) ?? {};
+  const automationSources = (automationData.sources as Row | undefined) ?? {};
+  const scheduler = (automationData.scheduler as Row | undefined) ?? {};
   return (
     <DataState loading={analytics.isLoading || sessions.isLoading} error={error} empty={false}>
       <div className="dashboard" data-testid="dashboard-live">
@@ -70,6 +75,7 @@ export function DashboardView() {
             ["Unreviewed", sessionRows.filter(row => row.status === "UNREVIEWED").length],
             ["Storage", storage.size_bytes != null ? `${(Number(storage.size_bytes) / 1_048_576).toFixed(1)} MiB` : String(storage.status ?? "unknown")],
             ["Worker", String((components.worker as Row | undefined)?.status ?? "unknown")],
+            ["24/7 capture", scheduler.capture_globally_enabled ? `${String(automationCaptures.enabled ?? 0)} schedules` : "disabled in env"],
           ].map(([label, value]) => <article key={String(label)}><span>{String(label)}</span><b>{String(value)}</b><small>Live indexed value</small></article>)}
         </section>
         <section className="panel recent"><header><div><span className="kicker">RECENT SESSIONS</span><h2>Indexed transmissions</h2></div><Link href="/sessions">View all</Link></header>{sessionRows.length ? <SessionTable rows={sessionRows}/> : <p className="notice">No sessions have been processed.</p>}</section>
@@ -77,7 +83,7 @@ export function DashboardView() {
         <aside className="panel entities"><span className="kicker">REPEATED ENTITIES</span><h2>Current index</h2><p><Layer kind="machine"/><b>{String((summary.top_callsigns as Row[] | undefined)?.[0]?.value ?? "None")}</b></p><p><Layer kind="machine"/><b>{String((summary.top_number_groups as Row[] | undefined)?.[0]?.value ?? "None")}</b></p></aside>
         <aside className="panel failures"><span className="kicker">PROCESSING FAILURES</span><h2>Action required</h2>{failedJobs.length ? failedJobs.map(row => <p key={String(row.id)}><i/><b>{String(row.stage)}</b><br/>{String(row.error_code ?? row.error_stderr ?? "Failed")}</p>) : <p>No failed jobs.</p>}</aside>
         <aside className="panel watch"><span className="kicker">WATCHLIST</span><h2>Frequencies</h2>{watchlist.length ? watchlist.slice(0, 8).map(row => <Link href={`/frequencies/${String(row.frequency_hz)}`} key={String(row.id)}><div><b>{formatFrequency(row.frequency_hz)}</b><small>{String(row.label)}</small></div></Link>) : <p>No watchlisted frequencies.</p>}</aside>
-        <aside className="panel failures"><span className="kicker">RECENT CAPTURE</span><h2>Scheduler</h2>{(captures.data?.data ?? []).slice(0, 5).map(row => <p key={String(row.id)}><b>{formatFrequency(row.frequency_hz)}</b><br/>{String(row.status)}</p>)}</aside>
+        <aside className="panel failures"><span className="kicker">AUTOMATION</span><h2>Runs without browser</h2><p><b>{String(automationSources.enabled ?? 0)}</b> continuous sources · <b>{String(automationCaptures.enabled ?? 0)}</b> capture schedules</p><p><b>{String(automationCaptures.active ?? 0)}</b> active capture/analysis jobs</p>{automation.data?.warnings?.map(warning => <p role="alert" key={warning}>{warning}</p>)}<Link href="/capture">Configure capture</Link></aside>
         <aside className="panel failures"><span className="kicker">HYPOTHESES</span><h2>Recent</h2>{hypothesisRows.length ? hypothesisRows.map(row => <p key={String(row.id)}><Link href={`/hypotheses/${String(row.id)}`}>{String(row.title)}</Link></p>) : <p>No hypotheses.</p>}</aside>
         <aside className="panel failures"><span className="kicker">SAVED QUERIES</span><h2>Reusable</h2>{(savedQueries.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.name)}</b><br/>{String(row.query_type)}</p>)}</aside>
       </div>
@@ -211,6 +217,32 @@ function ReceiverMap({ rows }: { rows: Row[] }) {
   return <div ref={ref} className="map" data-testid="receiver-map" aria-label="Receiver locations map"/>;
 }
 
+function ReceiverCaptureControl({ receiver }: { receiver: Row }) {
+  const client = useQueryClient();
+  const metadata = (receiver.metadata_json as Row | undefined) ?? {};
+  const [message, setMessage] = useState("");
+  const save = useMutation({
+    mutationFn: (payload: Row) => api<Envelope<Row>>(
+      `/receivers/${encodeURIComponent(String(receiver.id))}/capture`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+    ),
+    onSuccess: () => {
+      setMessage("Receiver capture transport saved. It can now be selected by autonomous schedules.");
+      void client.invalidateQueries({ queryKey: ["receiver", receiver.id] });
+      void client.invalidateQueries({ queryKey: ["receivers"] });
+      void client.invalidateQueries({ queryKey: ["automation-status"] });
+    },
+  });
+  return <section className="receiver-capture-control"><h3>Unattended capture transport</h3><p>Provide an authorised direct audio URL, not merely a browser tuning URL. The worker only accepts the registered receiver host and expands <code>{"{frequency_hz}"}</code>, <code>{"{frequency_khz}"}</code>, and <code>{"{mode}"}</code>.</p><form onSubmit={event => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    save.mutate({
+      capture_url_template: String(form.get("capture_url_template") || "") || null,
+      capture_enabled: form.get("capture_enabled") === "on",
+    });
+  }}><label>Direct audio URL template<input name="capture_url_template" type="text" inputMode="url" defaultValue={String(metadata.capture_url_template ?? "")} placeholder="https://receiver.example/audio?freq={frequency_hz}&mode={mode}"/></label><label><input name="capture_enabled" type="checkbox" defaultChecked={Boolean(metadata.capture_enabled)}/> I am authorised to capture from this receiver continuously</label><button disabled={save.isPending}>Save capture transport</button>{message ? <p role="status">{message}</p> : null}{save.error ? <p role="alert">{save.error.message}</p> : null}</form></section>;
+}
+
 export function ReceiversView({ id }: { id?: string }) {
   const list = useApi<Row[]>(["receivers"], "/receivers?limit=500");
   const detail = useApi<Row>(["receiver", id], id ? `/receivers/${encodeURIComponent(id)}` : "/capabilities");
@@ -219,7 +251,7 @@ export function ReceiversView({ id }: { id?: string }) {
   const selected = id ? detail.data?.data : undefined;
   return (
     <DataState loading={list.isLoading || (Boolean(id) && detail.isLoading)} error={list.error || (id ? detail.error : null)} empty={rows.length === 0}>
-      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred. Nearby receivers are clustered.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver</a><h3>Status history</h3>{(history.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.status)}</b><br/><span>{String(row.created_at)} · {String(row.latency_ms ?? "—")} ms</span></p>)}</> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
+      <div className="split"><section className="panel"><p className="map-note">Receiver positions only; transmitter location is not inferred. Nearby receivers are clustered.</p><ReceiverMap rows={rows}/></section><aside className="panel receiver-list">{selected ? <><Layer kind="observed"/><h2>{String(selected.name)}</h2><p>{String(selected.receiver_type)} · {String(selected.status)}</p><p>{formatFrequency(selected.min_frequency_hz)}–{formatFrequency(selected.max_frequency_hz)}</p><a className="primary" href={String(selected.base_url)} target="_blank" rel="noreferrer">Open receiver</a><ReceiverCaptureControl receiver={selected}/><h3>Status history</h3>{(history.data?.data ?? []).map(row => <p key={String(row.id)}><b>{String(row.status)}</b><br/><span>{String(row.created_at)} · {String(row.latency_ms ?? "—")} ms</span></p>)}</> : rows.map(row => <Link href={`/receivers/${String(row.id)}`} key={String(row.id)}><div><b>{String(row.name)}</b><span>{String(row.receiver_type)} · {String(row.status)}</span></div></Link>)}</aside></div>
     </DataState>
   );
 }

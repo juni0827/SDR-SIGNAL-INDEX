@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -27,12 +27,14 @@ from ..models import (
     HypothesisHistory,
     InboxItem,
     Provenance,
+    ProcessingJob,
     Receiver,
     ReceiverStatus,
     SavedQuery,
     SecretRecord,
     SettingRevision,
     Source,
+    SourceFetchJob,
 )
 from ..schemas import Envelope
 from ..security import encrypt_secret, validate_external_url
@@ -67,6 +69,15 @@ class CaptureCreate(BaseModel):
     retention_policy: dict[str, Any] = Field(default_factory=dict)
 
 
+class CapturePatch(BaseModel):
+    enabled: bool | None = None
+    schedule_utc: str | None = Field(default=None, min_length=1, max_length=160)
+    repetition: str | None = Field(default=None, max_length=160)
+    capture_duration_sec: int | None = Field(default=None, ge=1, le=86_400)
+    maximum_storage_bytes: int | None = Field(default=None, ge=1)
+    retention_policy: dict[str, Any] | None = None
+
+
 class SavedQueryCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     query_type: str = Field(min_length=1, max_length=60)
@@ -99,6 +110,19 @@ class SourcePatch(BaseModel):
     parser_version: str | None = Field(default=None, max_length=80)
     license_notes: str | None = Field(default=None, max_length=10_000)
     config: dict[str, Any] | None = None
+
+
+class ReceiverCapturePatch(BaseModel):
+    """Explicitly opt a receiver into unattended direct-audio capture.
+
+    A tuning page is not an audio transport.  The template therefore has to be
+    supplied by the owner for a receiver they are allowed to record from.  It
+    is rendered only with the three documented values and must remain on the
+    receiver's registered host.
+    """
+
+    capture_url_template: str | None = Field(default=None, max_length=2_048)
+    capture_enabled: bool | None = None
 
 
 class FrequencyPatch(BaseModel):
@@ -155,6 +179,17 @@ def list_model(db: Session, model: type[Any], limit: int) -> list[dict[str, Any]
     return [model_dict(row) for row in rows]
 
 
+def source_interval_sec(config: dict[str, Any]) -> int:
+    """Validate the bounded polling interval shared by create and update paths."""
+    try:
+        interval_sec = int(config.get("interval_sec", 3_600))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="source interval_sec must be an integer") from exc
+    if not 300 <= interval_sec <= 604_800:
+        raise HTTPException(status_code=422, detail="source interval_sec must be between 300 and 604800")
+    return interval_sec
+
+
 @router.get("/receivers", response_model=Envelope[list[dict[str, Any]]])
 def receivers(
     _user: CurrentUser,
@@ -170,6 +205,79 @@ def receiver(receiver_id: str, _user: CurrentUser, db: Session = Depends(get_db)
     if item is None or item.deleted_at is not None:
         raise HTTPException(status_code=404, detail="receiver not found")
     return Envelope(data=model_dict(item))
+
+
+@router.patch("/receivers/{receiver_id}/capture", response_model=Envelope[dict[str, Any]])
+def patch_receiver_capture(
+    receiver_id: str,
+    payload: ReceiverCapturePatch,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    """Configure a receiver-owned direct audio transport for the worker.
+
+    This endpoint deliberately does not guess WebSDR/KiwiSDR stream URLs. A
+    browser-tuning URL is often not a legal or usable recording stream. The
+    owner must provide an authorised direct-audio URL template on the same
+    host, then explicitly opt the receiver in.
+    """
+    item = db.get(Receiver, receiver_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="receiver not found")
+    metadata = dict(item.metadata_json or {})
+    before = {
+        "capture_url_template": metadata.get("capture_url_template"),
+        "capture_enabled": bool(metadata.get("capture_enabled", False)),
+    }
+    if payload.capture_url_template is not None:
+        try:
+            rendered = payload.capture_url_template.format(
+                frequency_hz=4_625_000,
+                frequency_khz=4_625.0,
+                mode="usb",
+            )
+        except (KeyError, ValueError, IndexError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "capture_url_template may use only {frequency_hz}, "
+                    "{frequency_khz}, and {mode}"
+                ),
+            ) from exc
+        base_host = item.base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        try:
+            validate_external_url(rendered, {base_host.lower()})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        metadata["capture_url_template"] = payload.capture_url_template
+    if payload.capture_enabled is not None:
+        if payload.capture_enabled and not metadata.get("capture_url_template"):
+            raise HTTPException(
+                status_code=422,
+                detail="capture_enabled requires an authorised capture_url_template",
+            )
+        metadata["capture_enabled"] = payload.capture_enabled
+    item.metadata_json = metadata
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="RECEIVER_CAPTURE_CONFIGURATION_UPDATED",
+            target_type="RECEIVER",
+            target_id=item.id,
+            detail={
+                "before": before,
+                "after": {
+                    "capture_url_template_configured": bool(metadata.get("capture_url_template")),
+                    "capture_enabled": bool(metadata.get("capture_enabled", False)),
+                },
+            },
+        )
+    )
+    db.commit()
+    data = model_dict(item)
+    data["capture_configured"] = bool(metadata.get("capture_url_template"))
+    data["capture_enabled"] = bool(metadata.get("capture_enabled", False))
+    return Envelope(data=data)
 
 
 @router.get(
@@ -394,7 +502,12 @@ def create_source(
         config = {**payload.config, "allowed_hosts": sorted(allowed_hosts)}
     else:
         config = payload.config
+    interval_sec = source_interval_sec(config) if remote else 3_600
     source = Source(**payload.model_dump(exclude={"config"}), config=config)
+    # An owner explicitly enabling a remote source expects the scheduler to
+    # collect it on its next Beat tick rather than one interval later.
+    if source.enabled:
+        source.last_fetched_at = datetime.now(UTC) - timedelta(seconds=interval_sec)
     db.add(source)
     db.commit()
     return Envelope(
@@ -424,8 +537,21 @@ def patch_source(
     changes = payload.model_dump(exclude_unset=True)
     if changes.get("enabled") and item.adapter_type not in {"rss_atom", "generic_html_table"}:
         raise HTTPException(status_code=422, detail="source adapter is not remotely fetchable")
+    if "config" in changes and changes["config"] is not None:
+        config = dict(changes["config"])
+        interval_sec = source_interval_sec(
+            {"interval_sec": config.get("interval_sec", item.config.get("interval_sec", 3_600))}
+        )
+        allowed_hosts = config.get("allowed_hosts", item.config.get("allowed_hosts", []))
+        if not isinstance(allowed_hosts, list) or not all(isinstance(host, str) for host in allowed_hosts):
+            raise HTTPException(status_code=422, detail="allowed_hosts must be a string list")
+        config["allowed_hosts"] = [host.lower().rstrip(".") for host in allowed_hosts]
+        changes["config"] = config
     for key, value in changes.items():
         setattr(item, key, value)
+    if changes.get("enabled") is True:
+        interval_sec = source_interval_sec(item.config)
+        item.last_fetched_at = datetime.now(UTC) - timedelta(seconds=max(300, interval_sec))
     db.commit()
     return Envelope(data=model_dict(item))
 
@@ -667,13 +793,18 @@ def capture(payload: CaptureCreate, _user: CurrentUser, db: Session = Depends(ge
     receiver = db.get(Receiver, payload.receiver_id)
     if receiver is None or receiver.deleted_at is not None:
         raise HTTPException(status_code=404, detail="receiver not found")
-    if payload.enabled and not receiver.metadata_json.get("capture_url_template"):
+    if payload.enabled and (
+        not receiver.metadata_json.get("capture_enabled")
+        or not receiver.metadata_json.get("capture_url_template")
+    ):
         raise HTTPException(
             status_code=422,
-            detail="enabled capture requires receiver.metadata.capture_url_template",
+            detail="enabled capture requires an explicitly enabled receiver capture transport",
         )
     try:
         next_run_at = next_schedule(payload.schedule_utc)
+        if payload.repetition:
+            next_schedule(payload.repetition)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     lock_key = (
@@ -697,6 +828,90 @@ def capture(payload: CaptureCreate, _user: CurrentUser, db: Session = Depends(ge
     )
 
 
+@router.patch("/capture/{capture_id}", response_model=Envelope[dict[str, Any]])
+def patch_capture(
+    capture_id: str,
+    payload: CapturePatch,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(CaptureJob, capture_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="capture job not found")
+    receiver = db.get(Receiver, item.receiver_id)
+    if receiver is None or receiver.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="capture receiver is no longer available")
+    changes = payload.model_dump(exclude_unset=True)
+    prospective_enabled = bool(changes.get("enabled", item.enabled))
+    if prospective_enabled and (
+        not receiver.metadata_json.get("capture_enabled")
+        or not receiver.metadata_json.get("capture_url_template")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="enabled capture requires an explicitly enabled receiver capture transport",
+        )
+    schedule = str(changes.get("schedule_utc", item.schedule_utc))
+    repetition = changes.get("repetition", item.repetition)
+    try:
+        next_run_at = next_schedule(schedule)
+        if repetition:
+            next_schedule(str(repetition))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    before = model_dict(item)
+    for key, value in changes.items():
+        setattr(item, key, value)
+    if prospective_enabled:
+        item.status = "SCHEDULED"
+        item.last_error = None
+        item.next_run_at = next_run_at
+    else:
+        item.status = "CANCELLED"
+        item.next_run_at = None
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="CAPTURE_SCHEDULE_UPDATED",
+            target_type="CAPTURE_JOB",
+            target_id=item.id,
+            detail={"before": before, "after": model_dict(item)},
+        )
+    )
+    db.commit()
+    return Envelope(
+        data=model_dict(item),
+        warnings=[] if item.enabled else ["capture schedule paused"],
+    )
+
+
+@router.post("/capture/{capture_id}/run-now", response_model=Envelope[dict[str, Any]], status_code=202)
+def run_capture_now(
+    capture_id: str,
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    item = db.get(CaptureJob, capture_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="capture job not found")
+    if not item.enabled:
+        raise HTTPException(status_code=409, detail="enable the capture schedule before running it")
+    if not settings.CAPTURE_ENABLED:
+        raise HTTPException(status_code=409, detail="CAPTURE_ENABLED is false in the worker environment")
+    if item.status in {"STARTING", "CAPTURING", "PROCESSING"}:
+        raise HTTPException(status_code=409, detail="capture job is already active")
+    try:
+        from audio_processor.tasks import capture_receiver
+
+        result = capture_receiver.delay(item.id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="capture worker queue is unavailable") from exc
+    item.status = "STARTING"
+    db.commit()
+    return Envelope(data={"capture_job_id": item.id, "task_id": result.id, "status": "STARTING"})
+
+
 @router.get("/capture", response_model=Envelope[list[dict[str, Any]]])
 def captures(
     _user: CurrentUser,
@@ -704,6 +919,98 @@ def captures(
     db: Session = Depends(get_db),
 ) -> Envelope[list[dict[str, Any]]]:
     return Envelope(data=list_model(db, CaptureJob, limit), pagination={"limit": limit})
+
+
+@router.get("/automation/status", response_model=Envelope[dict[str, Any]])
+def automation_status(
+    _user: CurrentUser,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Envelope[dict[str, Any]]:
+    """Expose the persisted autonomous-collection control plane.
+
+    The browser is only a control surface.  These counts are derived from the
+    database state consumed by the scheduler/worker containers, so they remain
+    meaningful while the user is offline.
+    """
+    now = datetime.now(UTC)
+    sources = list(
+        db.scalars(select(Source).where(Source.deleted_at.is_(None))).all()
+    )
+    captures = list(
+        db.scalars(select(CaptureJob).where(CaptureJob.deleted_at.is_(None))).all()
+    )
+    receiver_rows = list(
+        db.scalars(select(Receiver).where(Receiver.deleted_at.is_(None))).all()
+    )
+    source_jobs = list(
+        db.scalars(
+            select(SourceFetchJob).where(
+                SourceFetchJob.deleted_at.is_(None),
+                SourceFetchJob.status.in_(["FETCHING", "RETRYING"]),
+            )
+        ).all()
+    )
+    processing_jobs = list(
+        db.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.deleted_at.is_(None),
+                ProcessingJob.status.in_(["PENDING", "PROCESSING"]),
+            )
+        ).all()
+    )
+    enabled_sources = [source for source in sources if source.enabled]
+    enabled_captures = [job for job in captures if job.enabled]
+    configured_receivers = [
+        receiver
+        for receiver in receiver_rows
+        if receiver.metadata_json.get("capture_enabled")
+        and receiver.metadata_json.get("capture_url_template")
+    ]
+    warnings: list[str] = []
+    if enabled_captures and not settings.CAPTURE_ENABLED:
+        warnings.append("capture schedules are enabled but CAPTURE_ENABLED is false")
+    if enabled_captures and not configured_receivers:
+        warnings.append("no receiver has an explicitly enabled direct-audio transport")
+    return Envelope(
+        data={
+            "scheduler": {
+                "service": "celery-beat",
+                "runs_without_browser": True,
+                "capture_globally_enabled": settings.CAPTURE_ENABLED,
+                "source_tick_seconds": 60,
+                "capture_tick_seconds": 30,
+            },
+            "sources": {
+                "registered": len(sources),
+                "enabled": len(enabled_sources),
+                "active_fetches": len(source_jobs),
+            },
+            "captures": {
+                "registered": len(captures),
+                "enabled": len(enabled_captures),
+                "due": sum(
+                    1
+                    for job in enabled_captures
+                    if job.status == "SCHEDULED"
+                    and job.next_run_at is not None
+                    and job.next_run_at <= now
+                ),
+                "active": sum(
+                    1
+                    for job in captures
+                    if job.status in {"STARTING", "CAPTURING", "PROCESSING"}
+                ),
+                "failed": sum(1 for job in captures if job.status == "FAILED"),
+            },
+            "receivers": {
+                "registered": len(receiver_rows),
+                "capture_configured": len(configured_receivers),
+            },
+            "processing": {"active": len(processing_jobs)},
+        },
+        warnings=warnings,
+    )
 
 
 @router.post("/saved-queries", response_model=Envelope[dict[str, Any]], status_code=201)
